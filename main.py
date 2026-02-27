@@ -1,967 +1,899 @@
+from __future__ import annotations
+
 import json
 import os
-import sys
+import re
 import time
-import tiktoken
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import tiktoken
 from openai import OpenAI
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Prompt
+from rich.table import Table
 
-# --- CONFIG ---
-CONFIG = {
-    "base_url": "http://192.168.0.31:1234/v1",
-    "model": "qwen/qwen3.5-35b-a3b",
-    "auto_pilot": True,
-    "stop_only_on_complete": True,  # Only stop when phase is READY_FOR_HUMAN with success, else rerun
+
+CONFIG: dict[str, Any] = {
+	"base_url": os.getenv("RALPH_BASE_URL", "http://192.168.0.31:1234/v1"),
+	"model": os.getenv("RALPH_MODEL", "qwen/qwen3.5-35b-a3b"),
+	"api_key": os.getenv("OPENAI_API_KEY", "lm-studio"),
+	"auto_pilot": os.getenv("RALPH_AUTO_PILOT", "true").lower() == "true",
+	"stop_only_on_complete": os.getenv("RALPH_STOP_ONLY_ON_COMPLETE", "true").lower() == "true",
+	"max_tool_turns": int(os.getenv("RALPH_MAX_TOOL_TURNS", "10")),
+	"max_context_tokens": int(os.getenv("RALPH_MAX_CONTEXT_TOKENS", "16000")),
+	"max_tool_calls_per_iteration": int(os.getenv("RALPH_MAX_TOOL_CALLS_PER_ITERATION", "0")),
+	"summary_max_chars": 800,
 }
 
-# --- STATE MACHINE ---
-STATE_MACHINE = {
-    "CHARACTER_CREATION": {
-        "description": "Develop characters, their backgrounds, motivations, and arcs",
-        "transitions": ["WORLD_BUILDING", "CHARACTER_CREATION"]
-    },
-    "WORLD_BUILDING": {
-        "description": "Create the setting, rules, cultures, and world context",
-        "transitions": ["PLOT_OUTLINING", "WORLD_BUILDING", "CHARACTER_CREATION"]
-    },
-    "PLOT_OUTLINING": {
-        "description": "Structure the story beats, acts, and narrative arc",
-        "transitions": ["SCENE_WRITING", "PLOT_OUTLINING", "WORLD_BUILDING"]
-    },
-    "SCENE_WRITING": {
-        "description": "Write actual manuscript prose scene by scene",
-        "transitions": ["SCENE_WRITING", "REVISION", "PLOT_OUTLINING"]
-    },
-    "REVISION": {
-        "description": "Review and refine existing content, check consistency",
-        "transitions": ["SCENE_WRITING", "REVISION", "READY_FOR_HUMAN"]
-    },
-    "READY_FOR_HUMAN": {
-        "description": "Story complete and polished - ready for human review",
-        "transitions": []  # Terminal state
-    }
+
+STATE_MACHINE: dict[str, dict[str, Any]] = {
+	"CHARACTER_CREATION": {
+		"description": "Develop characters, motivations, arcs, and relationships.",
+		"transitions": ["WORLD_BUILDING", "CHARACTER_CREATION"],
+	},
+	"WORLD_BUILDING": {
+		"description": "Establish setting rules, culture, and story context.",
+		"transitions": ["PLOT_OUTLINING", "WORLD_BUILDING", "CHARACTER_CREATION"],
+	},
+	"PLOT_OUTLINING": {
+		"description": "Design narrative structure, beats, and progression.",
+		"transitions": ["SCENE_WRITING", "PLOT_OUTLINING", "WORLD_BUILDING"],
+	},
+	"SCENE_WRITING": {
+		"description": "Write and expand manuscript prose.",
+		"transitions": ["SCENE_WRITING", "REVISION", "PLOT_OUTLINING"],
+	},
+	"REVISION": {
+		"description": "Refine prose, consistency, and narrative quality.",
+		"transitions": ["SCENE_WRITING", "REVISION", "READY_FOR_HUMAN"],
+	},
+	"READY_FOR_HUMAN": {
+		"description": "Terminal state: manuscript ready for human review.",
+		"transitions": [],
+	},
 }
 
-# Phase-specific guidance — only the current phase's text is included in the prompt
-PHASE_GUIDE = {
-    "CHARACTER_CREATION": (
-        "Develop characters with names, roles, motivations, arcs, and relationships.\n"
-        "Store each character under its own state key (e.g., write_state key='char_red').\n"
-        "When characters are well-defined, transition to WORLD_BUILDING."
-    ),
-    "WORLD_BUILDING": (
-        "Create the setting, rules, cultures, and world context.\n"
-        "Store world data in organized keys (e.g., 'world_locations', 'world_rules').\n"
-        "When the world is fleshed out, transition to PLOT_OUTLINING."
-    ),
-    "PLOT_OUTLINING": (
-        "Structure the story: acts, beats, chapter outlines, pacing.\n"
-        "Store plot structure in state (e.g., 'plot_beats', 'chapter_outline').\n"
-        "When the outline is solid, transition to SCENE_WRITING."
-    ),
-    "SCENE_WRITING": (
-        "Write prose for the manuscript. Use read_manuscript_tail() to get context for continuing.\n"
-        "Use append_to_manuscript() for new content or create_section() for organized chapters.\n"
-        "Write one scene/chapter per iteration. When all scenes are written, transition to REVISION."
-    ),
-    "REVISION": (
-        "Review and polish the manuscript. Use search_manuscript() to find issues.\n"
-        "Use replace_section() to fix content. Check consistency against your state.\n"
-        "When fully polished, transition to READY_FOR_HUMAN."
-    ),
-    "READY_FOR_HUMAN": "The story is complete. No further action needed.",
+
+PHASE_GUIDE: dict[str, str] = {
+	"CHARACTER_CREATION": (
+		"Store character definitions with role, voice, motivation, fear, desire, and arc in notes. "
+		"Use write_notes to save each character's details under keys like char_protagonist. "
+		"Transition when cast and relationships are stable."
+	),
+	"WORLD_BUILDING": (
+		"Create setting rules, social structures, geography, tone, constraints, and stakes in notes. "
+		"Use write_notes to persist world details using structured objects. "
+		"Transition when the world can consistently support plot and scenes."
+	),
+	"PLOT_OUTLINING": (
+		"Build arc progression and scene-level beat outline in notes. "
+		"Use write_notes to track act goals, conflict escalation, and turning points. "
+		"Transition when beat flow is coherent and ready for prose drafting."
+	),
+	"SCENE_WRITING": (
+		"Write manuscript prose using section operations or append operations. "
+		"Use read_manuscript tools for continuity before writing. Store any planning notes in notes. "
+		"Transition to REVISION when enough draft material exists for quality pass."
+	),
+	"REVISION": (
+		"Audit continuity, pacing, clarity, and character consistency. "
+		"Use search and section replacement to repair prose surgically. Store revision notes in notes. "
+		"Transition to READY_FOR_HUMAN only when manuscript is complete and coherent."
+	),
+	"READY_FOR_HUMAN": "No further writing needed. Provide concise completion notes.",
 }
+
+
+PROJECTS_DIR = Path("projects")
+DEFAULT_STATE = {
+	"phase": "CHARACTER_CREATION",
+	"manuscript_file": "",
+	"initial_seed": "",
+	"user_feedback": "",
+	"previous_summary": "",
+	"ai_state": {},
+}
+
+SECTION_PATTERN = re.compile(
+	r"<!-- SECTION: (?P<name>[^\n]+?) -->\n(?P<content>.*?)\n<!-- END SECTION: (?P=name) -->",
+	re.DOTALL,
+)
 
 console = Console()
-client = OpenAI(base_url=CONFIG["base_url"], api_key="lm-studio")
-encoding = tiktoken.get_encoding("cl100k_base")
 
-def get_token_count(text):
-    return len(encoding.encode(text))
 
-# --- PROJECT MANAGEMENT ---
-def list_projects():
-    if not os.path.exists("projects"):
-        os.makedirs("projects")
-        return []
-    return [d for d in os.listdir("projects") if os.path.isdir(os.path.join("projects", d))]
+def now_iso() -> str:
+	return datetime.now().isoformat(timespec="seconds")
 
-def setup_project(name):
-    base_dir = f"projects/{name}"
-    os.makedirs(base_dir, exist_ok=True)
-    state_path = f"{base_dir}/state.json"
-    stats_path = f"{base_dir}/stats.json"
-    manuscript_path = f"{base_dir}/manuscript.md"
-    
-    is_new = not os.path.exists(state_path)
-    
-    if is_new:
-        console.print(Panel(f"🌟 [bold green]Creating New Project: {name}[/bold green]"))
-        seed = Prompt.ask("[bold cyan]Enter the initial story seed/prompt[/bold cyan]")
-        
-        initial_state = {
-            "phase": "CHARACTER_CREATION",
-            "manuscript_file": manuscript_path,
-            "user_feedback": seed,  # The seed becomes the first feedback
-            "previous_summary": "",  # LLM's notes-to-self between iterations
-            "ai_state": {}  # Free-form state managed by the LLM
-        }
-        with open(state_path, "w") as f:
-            json.dump(initial_state, f, indent=4)
-            
-        with open(stats_path, "w") as f:
-            json.dump({"loops": [], "total_input_tokens": 0, "total_output_tokens": 0, "total_time_seconds": 0}, f)
-            
-    return state_path, stats_path, manuscript_path
 
-# --- MANUSCRIPT HELPERS ---
-def _read_manuscript(manuscript_path):
-    """Read manuscript content, return empty string if doesn't exist."""
-    if not os.path.exists(manuscript_path):
-        return ""
-    with open(manuscript_path, "r", encoding="utf-8") as f:
-        return f.read()
+def safe_project_name(name: str) -> str:
+	cleaned = re.sub(r"[^a-zA-Z0-9_\- ]+", "", name).strip()
+	cleaned = cleaned.replace(" ", "_")
+	return cleaned or "untitled_project"
 
-def _write_manuscript(manuscript_path, content):
-    """Write manuscript content."""
-    with open(manuscript_path, "w", encoding="utf-8") as f:
-        f.write(content.strip())
 
-def _describe_value(v):
-    """Compact type+size description of a value for list_state_keys."""
-    if isinstance(v, dict):
-        return f"object ({len(v)} keys)"
-    elif isinstance(v, list):
-        return f"list ({len(v)} items)"
-    elif isinstance(v, str):
-        words = len(v.split())
-        return f"string ({words} words)" if words > 10 else f"string ({len(v)} chars)"
-    elif isinstance(v, bool):
-        return str(v)
-    elif isinstance(v, (int, float)):
-        return str(v)
-    else:
-        return type(v).__name__
+def read_json(path: Path, default: Any) -> Any:
+	if not path.exists():
+		return default
+	with path.open("r", encoding="utf-8") as handle:
+		return json.load(handle)
 
-def get_manuscript_info(manuscript_path):
-    """Get manuscript table-of-contents: sections, word counts, line counts.
-    Returns NO prose content — use read_manuscript_section or read_manuscript_tail for that."""
-    content = _read_manuscript(manuscript_path)
-    if not content:
-        return {"exists": False, "word_count": 0, "line_count": 0, "sections": []}
-    
-    lines = content.split("\n")
-    sections = []
-    section_stack = []
-    
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("<!-- SECTION:") and not stripped.startswith("<!-- END"):
-            name = stripped.replace("<!-- SECTION:", "").replace("-->", "").strip()
-            section_stack.append({"name": name, "start": i + 1, "words": 0})
-        elif stripped.startswith("<!-- END SECTION:"):
-            if section_stack:
-                section = section_stack.pop()
-                section["end"] = i + 1
-                sections.append(section)
-        elif section_stack:
-            section_stack[-1]["words"] += len(line.split())
-    
-    return {
-        "exists": True,
-        "word_count": len(content.split()),
-        "line_count": len(lines),
-        "sections": [
-            {"name": s["name"], "lines": f"{s['start']}-{s['end']}", "words": s["words"]}
-            for s in sections
-        ]
-    }
 
-def read_manuscript_section_content(manuscript_path, section_name):
-    """Read content of a specific named section."""
-    content = _read_manuscript(manuscript_path)
-    start_marker = f"<!-- SECTION: {section_name} -->"
-    end_marker = f"<!-- END SECTION: {section_name} -->"
-    
-    if start_marker not in content:
-        return None
-    
-    start_idx = content.find(start_marker) + len(start_marker)
-    end_idx = content.find(end_marker)
-    if end_idx == -1:
-        return None
-    
-    return content[start_idx:end_idx].strip()
+def write_json(path: Path, data: Any) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	with path.open("w", encoding="utf-8") as handle:
+		json.dump(data, handle, ensure_ascii=False, indent=2)
 
-def read_manuscript_tail(manuscript_path, word_count=500):
-    """Read the last N words of the manuscript for continuation context."""
-    content = _read_manuscript(manuscript_path)
-    if not content:
-        return ""
-    words = content.split()
-    if len(words) <= word_count:
-        return content
-    return "...\n" + " ".join(words[-word_count:])
 
-def search_in_manuscript(manuscript_path, query, context_lines=2, max_results=10):
-    """Search manuscript for text, return matches with surrounding context."""
-    content = _read_manuscript(manuscript_path)
-    if not content:
-        return []
-    
-    lines = content.split("\n")
-    matches = []
-    query_lower = query.lower()
-    
-    for i, line in enumerate(lines):
-        if query_lower in line.lower():
-            start = max(0, i - context_lines)
-            end = min(len(lines), i + context_lines + 1)
-            context = "\n".join(lines[start:end])
-            matches.append({"line": i + 1, "context": context})
-            if len(matches) >= max_results:
-                break
-    
-    return matches
+def count_words(text: str) -> int:
+	return len(re.findall(r"\S+", text))
 
-# --- FUNCTION TOOLS DEFINITION ---
-# Each tool does exactly ONE thing with the simplest possible parameters.
-# No compound array-of-operations tools. No overloaded read tools.
-def get_function_tools():
-    """Define atomic function tools for the LLM."""
-    return [
-        # ── STATE: list keys ──
-        {
-            "type": "function",
-            "function": {
-                "name": "list_state_keys",
-                "description": "List all keys stored in your persistent state. Returns key names with value types and sizes. Call this first to see what data you've previously saved.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            }
-        },
-        # ── STATE: read one key ──
-        {
-            "type": "function",
-            "function": {
-                "name": "read_state",
-                "description": "Read the value stored under a key. Use list_state_keys() first to see available keys.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "Key name to read"
-                        }
-                    },
-                    "required": ["key"]
-                }
-            }
-        },
-        # ── STATE: write one key ──
-        {
-            "type": "function",
-            "function": {
-                "name": "write_state",
-                "description": "Store data under a key (overwrites if exists). Use descriptive key names like 'char_alice', 'world_locations', 'plot_act2_beats'.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "Key name (use snake_case, descriptive)"
-                        },
-                        "data": {
-                            "description": "Any JSON-serializable data to store (object, array, string, number, etc.)"
-                        }
-                    },
-                    "required": ["key", "data"]
-                }
-            }
-        },
-        # ── STATE: delete key ──
-        {
-            "type": "function",
-            "function": {
-                "name": "delete_state",
-                "description": "Delete a key from state storage. Use to clean up obsolete data.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "Key to delete"
-                        }
-                    },
-                    "required": ["key"]
-                }
-            }
-        },
-        # ── MANUSCRIPT: info/outline ──
-        {
-            "type": "function",
-            "function": {
-                "name": "get_manuscript_info",
-                "description": "Get the manuscript table of contents: section names, line ranges, word counts per section, and total stats. Returns NO prose — for actual text, use read_manuscript_section or read_manuscript_tail.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            }
-        },
-        # ── MANUSCRIPT: read section ──
-        {
-            "type": "function",
-            "function": {
-                "name": "read_manuscript_section",
-                "description": "Read the prose content of one named section. Use get_manuscript_info() first to see available section names.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "section_name": {
-                            "type": "string",
-                            "description": "Exact section name from get_manuscript_info()"
-                        }
-                    },
-                    "required": ["section_name"]
-                }
-            }
-        },
-        # ── MANUSCRIPT: read tail ──
-        {
-            "type": "function",
-            "function": {
-                "name": "read_manuscript_tail",
-                "description": "Read the last N words of the manuscript. Use this before writing to get continuation context. Default 500 words.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "word_count": {
-                            "type": "integer",
-                            "description": "Number of words from the end (default: 500)",
-                            "default": 500
-                        }
-                    },
-                    "required": []
-                }
-            }
-        },
-        # ── MANUSCRIPT: search ──
-        {
-            "type": "function",
-            "function": {
-                "name": "search_manuscript",
-                "description": "Search the manuscript for a text string (case-insensitive). Returns matching lines with surrounding context. Useful during revision to find inconsistencies.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Text to search for"
-                        },
-                        "context_lines": {
-                            "type": "integer",
-                            "description": "Lines of context around each match (default: 2)",
-                            "default": 2
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        },
-        # ── MANUSCRIPT: append ──
-        {
-            "type": "function",
-            "function": {
-                "name": "append_to_manuscript",
-                "description": "Append new prose to the end of the manuscript.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "Prose text to append"
-                        }
-                    },
-                    "required": ["content"]
-                }
-            }
-        },
-        # ── MANUSCRIPT: create section ──
-        {
-            "type": "function",
-            "function": {
-                "name": "create_section",
-                "description": "Create a new named section at the end of the manuscript. Wraps content in section markers so it can be replaced or deleted later.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Section name identifier"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Section content"
-                        }
-                    },
-                    "required": ["name", "content"]
-                }
-            }
-        },
-        # ── MANUSCRIPT: replace section ──
-        {
-            "type": "function",
-            "function": {
-                "name": "replace_section",
-                "description": "Replace the content of an existing named section, keeping the section markers. Use get_manuscript_info() to see available sections.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Section name to replace"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "New content for the section"
-                        }
-                    },
-                    "required": ["name", "content"]
-                }
-            }
-        },
-        # ── MANUSCRIPT: delete section ──
-        {
-            "type": "function",
-            "function": {
-                "name": "delete_section",
-                "description": "Remove a named section and all its content from the manuscript.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Section name to delete"
-                        }
-                    },
-                    "required": ["name"]
-                }
-            }
-        },
-        # ── PHASE: change ──
-        {
-            "type": "function",
-            "function": {
-                "name": "change_phase",
-                "description": "Transition to a different writing phase. Only transition when you have completed meaningful work in the current phase.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "new_phase": {
-                            "type": "string",
-                            "enum": list(STATE_MACHINE.keys()),
-                            "description": "Target phase"
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Brief reason for transition"
-                        }
-                    },
-                    "required": ["new_phase", "reason"]
-                }
-            }
-        }
-    ]
 
-def execute_function(function_name, arguments, state, manuscript_path):
-    """Execute a tool call. Returns minimal data to save tokens."""
-    try:
-        args = json.loads(arguments) if isinstance(arguments, str) else arguments
-    except json.JSONDecodeError:
-        return {"error": "Invalid JSON arguments"}
-    
-    ai_state = state.setdefault("ai_state", {})
-    
-    # ── STATE TOOLS ──
-    if function_name == "list_state_keys":
-        if not ai_state:
-            return {"keys": []}
-        return {k: _describe_value(v) for k, v in ai_state.items()}
-    
-    elif function_name == "read_state":
-        key = args.get("key", "")
-        if key not in ai_state:
-            return {"error": f"'{key}' not found", "available": list(ai_state.keys())}
-        return ai_state[key]
-    
-    elif function_name == "write_state":
-        try:
-            key = args.get("key", "")
-            data = args.get("data")
-            if not key:
-                return {"error": "Missing 'key' parameter"}
-            ai_state[key] = data
-            return "ok"
-        except Exception as e:
-            return {"error": f"Failed to write state: {e}"}
-    
-    elif function_name == "delete_state":
-        key = args.get("key", "")
-        if key in ai_state:
-            del ai_state[key]
-            return "ok"
-        return {"error": f"'{key}' not found"}
-    
-    # ── MANUSCRIPT READ TOOLS ──
-    elif function_name == "get_manuscript_info":
-        return get_manuscript_info(manuscript_path)
-    
-    elif function_name == "read_manuscript_section":
-        try:
-            section_name = args.get("section_name", "")
-            if not section_name:
-                return {"error": "Missing 'section_name' parameter"}
-            content = read_manuscript_section_content(manuscript_path, section_name)
-            if content is None:
-                info = get_manuscript_info(manuscript_path)
-                return {"error": f"Section '{section_name}' not found", "available": [s["name"] for s in info["sections"]]}
-            return content
-        except Exception as e:
-            return {"error": f"Failed to read section: {e}"}
-    
-    elif function_name == "read_manuscript_tail":
-        wc = args.get("word_count", 500)
-        return read_manuscript_tail(manuscript_path, wc)
-    
-    elif function_name == "search_manuscript":
-        query = args.get("query", "")
-        ctx = args.get("context_lines", 2)
-        matches = search_in_manuscript(manuscript_path, query, ctx)
-        if not matches:
-            return {"matches": [], "note": "No results found"}
-        return {"matches": matches}
-    
-    # ── MANUSCRIPT WRITE TOOLS ──
-    elif function_name == "append_to_manuscript":
-        try:
-            content = _read_manuscript(manuscript_path)
-            new_text = args.get("content", "")
-            if not isinstance(new_text, str):
-                return {"error": "'content' must be a string"}
-            content = (content + "\n\n" + new_text).strip()
-            _write_manuscript(manuscript_path, content)
-            return f"appended {len(new_text.split())} words (total: {len(content.split())})"
-        except Exception as e:
-            return {"error": f"Failed to append: {e}"}
-    
-    elif function_name == "create_section":
-        try:
-            content = _read_manuscript(manuscript_path)
-            name = args.get("name", "")
-            section_text = args.get("content", "")
-            if not name:
-                return {"error": "Missing 'name' parameter"}
-            if not isinstance(section_text, str):
-                return {"error": "'content' must be a string"}
-            block = f"<!-- SECTION: {name} -->\n{section_text}\n<!-- END SECTION: {name} -->"
-            content = (content + "\n\n" + block).strip()
-            _write_manuscript(manuscript_path, content)
-            return f"created section '{name}' ({len(section_text.split())} words)"
-        except Exception as e:
-            return {"error": f"Failed to create section: {e}"}
-    
-    elif function_name == "replace_section":
-        try:
-            content = _read_manuscript(manuscript_path)
-            name = args.get("name", "")
-            new_text = args.get("content", "")
-            if not name:
-                return {"error": "Missing 'name' parameter"}
-            if not isinstance(new_text, str):
-                return {"error": "'content' must be a string"}
-            start_marker = f"<!-- SECTION: {name} -->"
-            end_marker = f"<!-- END SECTION: {name} -->"
-            
-            if start_marker in content and end_marker in content:
-                start_idx = content.find(start_marker)
-                end_idx = content.find(end_marker) + len(end_marker)
-                content = content[:start_idx] + start_marker + "\n" + new_text + "\n" + end_marker + content[end_idx:]
-                _write_manuscript(manuscript_path, content)
-                return f"replaced section '{name}' ({len(new_text.split())} words)"
-            else:
-                info = get_manuscript_info(manuscript_path)
-                return {"error": f"Section '{name}' not found", "available": [s["name"] for s in info["sections"]]}
-        except Exception as e:
-            return {"error": f"Failed to replace section: {e}"}
-    
-    elif function_name == "delete_section":
-        try:
-            content = _read_manuscript(manuscript_path)
-            name = args.get("name", "")
-            if not name:
-                return {"error": "Missing 'name' parameter"}
-            start_marker = f"<!-- SECTION: {name} -->"
-            end_marker = f"<!-- END SECTION: {name} -->"
-            
-            if start_marker in content and end_marker in content:
-                start_idx = content.find(start_marker)
-                end_idx = content.find(end_marker) + len(end_marker)
-                content = content[:start_idx] + content[end_idx:]
-                _write_manuscript(manuscript_path, content)
-                return f"deleted section '{name}'"
-            else:
-                return {"error": f"Section '{name}' not found"}
-        except Exception as e:
-            return {"error": f"Failed to delete section: {e}"}
-    
-    # ── PHASE ──
-    elif function_name == "change_phase":
-        try:
-            new_phase = args.get("new_phase", "")
-            reason = args.get("reason", "")
-            if not new_phase:
-                return {"error": "Missing 'new_phase' parameter"}
-            valid = STATE_MACHINE.get(state["phase"], {}).get("transitions", [])
-            if new_phase not in valid:
-                return {"error": f"Cannot go from {state['phase']} to {new_phase}", "valid": valid}
-            old = state["phase"]
-            state["phase"] = new_phase
-            return f"phase: {old} → {new_phase}"
-        except Exception as e:
-            return {"error": f"Failed to change phase: {e}"}
-    
-    else:
-        return {"error": f"Unknown function: {function_name}"}
+def line_number_of_index(text: str, index: int) -> int:
+	return text[:index].count("\n") + 1
 
-# --- SYSTEM PROMPT BUILDER ---
-def build_system_prompt(state, manuscript_path):
-    """Build a focused system prompt using only what the LLM needs this iteration.
-    
-    Instead of dumping the full state machine, all phases, and generic workflow tips,
-    we include: current phase + its guidance, manuscript stats at a glance, state key
-    names (not values), and the previous iteration summary for continuity.
-    """
-    phase = state["phase"]
-    info = STATE_MACHINE.get(phase, {})
-    transitions = info.get("transitions", [])
-    
-    # Compact manuscript stats
-    ms_info = get_manuscript_info(manuscript_path)
-    if ms_info["exists"]:
-        section_names = ", ".join(s["name"] for s in ms_info["sections"]) or "none"
-        ms_status = f"{ms_info['word_count']} words, {ms_info['line_count']} lines, sections: [{section_names}]"
-    else:
-        ms_status = "empty"
-    
-    # State key names only (not values)
-    ai_keys = ", ".join(state.get("ai_state", {}).keys()) or "none"
-    
-    prompt = (
-        f"You are a story-writing engine.\n\n"
-        f"PHASE: {phase} — {info.get('description', '')}\n"
-        f"Transitions: {', '.join(transitions) if transitions else 'terminal (story complete)'}\n"
-        f"Manuscript: {ms_status}\n"
-        f"State keys: [{ai_keys}]\n\n"
-        f"GUIDE:\n{PHASE_GUIDE.get(phase, '')}\n\n"
-    )
-    
-    # Previous iteration context — gives the LLM memory between loops
-    prev = state.get("previous_summary", "")
-    if prev:
-        prompt += f"YOUR NOTES FROM LAST ITERATION:\n{prev}\n\n"
-    
-    prompt += (
-        "IMPORTANT: End your response with a brief note-to-self summarizing what you "
-        "accomplished and what to do next. This note will be shown to you at the start "
-        "of the next iteration as memory."
-    )
-    
-    return prompt
 
-# --- ENGINE ---
-def run_iteration(state, project_name, manuscript_path):
-    start_time = time.time()
-    phase = state["phase"]
-    
-    # Get state machine info for display
-    current_phase_info = STATE_MACHINE.get(phase, {})
-    phase_description = current_phase_info.get("description", "Unknown phase")
-    available_transitions = current_phase_info.get("transitions", [])
-    
-    # Build focused system prompt
-    system_prompt = build_system_prompt(state, manuscript_path)
-    user_msg = state.get("user_feedback") or "Continue with your creative process."
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_msg}
-    ]
-    
-    # Get manuscript info for display
-    manuscript_info = get_manuscript_info(manuscript_path)
-    
-    # Build phase visualization
-    transitions_text = " → ".join(available_transitions) if available_transitions else "✓ Terminal"
-    manuscript_summary = f"{manuscript_info['word_count']} words" if manuscript_info['exists'] else "Empty"
-    
-    console.print(Panel(
-        f"[bold blue]Project:[/bold blue] {project_name}\n"
-        f"[bold magenta]Phase:[/bold magenta] {phase}\n"
-        f"[dim]{phase_description}[/dim]\n"
-        f"[bold cyan]Next Steps:[/bold cyan] {transitions_text}\n"
-        f"[bold yellow]Manuscript:[/bold yellow] {manuscript_summary}",
-        title="🚀 Story Engine Status"
-    ))
-    
-    input_tokens = 0
-    output_tokens = 0
-    full_response = ""
-    tool_calls_made = []
-    max_iterations = 15  # Allow more iterations since tools are granular now
-    iteration = 0
-    
-    try:
-        while iteration < max_iterations:
-            iteration += 1
-            
-            # Make API call with tools
-            response = client.chat.completions.create(
-                model=CONFIG["model"],
-                messages=messages,
-                tools=get_function_tools(),
-                tool_choice="auto"
-            )
-            
-            # Safely parse response with fallback for malformed responses
-            try:
-                message = response.choices[0].message
-            except (IndexError, AttributeError, KeyError) as e:
-                raise RuntimeError(f"Invalid response structure: {e}")
-            
-            input_tokens += response.usage.prompt_tokens if hasattr(response, 'usage') and response.usage else get_token_count(str(messages))
-            output_tokens += response.usage.completion_tokens if hasattr(response, 'usage') and response.usage else get_token_count(str(getattr(message, 'content', None) or ""))
-            
-            # Display assistant's response if any
-            message_content = getattr(message, 'content', None)
-            if message_content:
-                console.print(f"\n[bold yellow]LLM:[/bold yellow] {message_content}")
-                full_response += message_content + "\n"
-            
-            # Check if there are tool calls (safely access the attribute)
-            tool_calls = getattr(message, 'tool_calls', None)
-            if not tool_calls:
-                # No more tool calls, we're done
-                break
-            
-            # Add assistant message to conversation
-            messages.append(message)
-            
-            # Execute each tool call
-            for tool_call in tool_calls:
-                function_name = tool_call.function.name
-                arguments = tool_call.function.arguments
-                
-                console.print(f"\n[bold cyan]🔧 Tool Call:[/bold cyan] {function_name}")
-                console.print(f"[dim]Arguments: {arguments[:200]}{'...' if len(arguments) > 200 else ''}[/dim]")
-                
-                # Execute the function
-                result = execute_function(function_name, arguments, state, manuscript_path)
-                result_json = json.dumps(result)
-                
-                # Show truncated result in console
-                display_result = result_json[:300] + "..." if len(result_json) > 300 else result_json
-                console.print(f"[bold green]✓ Result:[/bold green] {display_result}")
-                
-                tool_calls_made.append({
-                    "function": function_name,
-                    "arguments": arguments,
-                    "result_size": len(result_json)
-                })
-                
-                # Add tool response to messages
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": function_name,
-                    "content": result_json
-                })
-        
-        if iteration >= max_iterations:
-            console.print(f"[yellow]Warning: Reached maximum tool call iterations ({max_iterations})[/yellow]")
-        
-    except Exception as e:
-        console.print(f"[bold red]LM Studio Error:[/bold red] {e}")
-        duration = time.time() - start_time
-        return None, input_tokens, output_tokens, duration, []
+def parse_sections(text: str) -> list[dict[str, Any]]:
+	sections: list[dict[str, Any]] = []
+	for match in SECTION_PATTERN.finditer(text):
+		section_name = match.group("name").strip()
+		content = match.group("content").strip("\n")
+		start = match.start()
+		end = match.end()
+		sections.append(
+			{
+				"name": section_name,
+				"content": content,
+				"start": start,
+				"end": end,
+				"start_line": line_number_of_index(text, start),
+				"end_line": line_number_of_index(text, end),
+				"words": count_words(content),
+			}
+		)
+	return sections
 
-    # Capture the LLM's last text response as the iteration summary for next loop
-    if full_response.strip():
-        summary = full_response.strip()
-        # Truncate to avoid bloating the system prompt on next iteration
-        if len(summary) > 800:
-            summary = summary[:800] + "..."
-        state["previous_summary"] = summary
 
-    duration = time.time() - start_time
-    return full_response, input_tokens, output_tokens, duration, tool_calls_made
+def read_manuscript(path: Path) -> str:
+	if not path.exists():
+		path.parent.mkdir(parents=True, exist_ok=True)
+		path.write_text("", encoding="utf-8")
+	return path.read_text(encoding="utf-8")
 
-def update_logs(stats_path, loop_data):
-    with open(stats_path, "r") as f:
-        stats = json.load(f)
-    
-    stats["loops"].append(loop_data)
-    stats["total_input_tokens"] += loop_data["in_tokens"]
-    stats["total_output_tokens"] += loop_data["out_tokens"]
-    stats["total_time_seconds"] = stats.get("total_time_seconds", 0) + loop_data.get("duration_seconds", 0)
-    
-    with open(stats_path, "w") as f:
-        json.dump(stats, f, indent=4)
-    return stats
 
-def show_stats(stats):
-    table = Table(title="📊 Ralph Engine Statistics")
-    table.add_column("Loop #", style="cyan")
-    table.add_column("Phase", style="magenta")
-    table.add_column("Result", style="green")
-    table.add_column("Tokens (In/Out)", style="yellow")
-    table.add_column("Time", style="blue")
+def write_manuscript(path: Path, content: str) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	path.write_text(content, encoding="utf-8")
 
-    for i, loop in enumerate(stats["loops"][-5:]):
-        duration = loop.get("duration_seconds", 0)
-        time_str = f"{duration:.1f}s"
-        table.add_row(
-            str((max(len(stats["loops"]) - 5, 0) + i + 1)), 
-            loop["phase"], 
-            loop["status"], 
-            f"{loop['in_tokens']}/{loop['out_tokens']}",
-            time_str
-        )
-    
-    total_tokens = stats['total_input_tokens'] + stats['total_output_tokens']
-    total_time = stats.get('total_time_seconds', 0)
-    total_time_str = f"{total_time/60:.1f}m" if total_time >= 60 else f"{total_time:.1f}s"
-    
-    console.print(table)
-    console.print(f"[dim]Total Token Burn: {total_tokens} | Total Time: {total_time_str}[/dim]\n")
 
-# --- MAIN ---
+def choose_or_create_project() -> tuple[str, Path, Path, Path]:
+	PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+	existing = sorted([p for p in PROJECTS_DIR.iterdir() if p.is_dir()])
+
+	if existing:
+		choices = ", ".join(p.name for p in existing)
+		console.print(f"[cyan]Available projects:[/cyan] {choices}")
+		selected = Prompt.ask("Project name to open (or new name to create)")
+	else:
+		selected = Prompt.ask("Project name")
+
+	project_name = safe_project_name(selected)
+	project_dir = PROJECTS_DIR / project_name
+	state_path = project_dir / "state.json"
+	stats_path = project_dir / "stats.json"
+	manuscript_path = project_dir / "manuscript.md"
+
+	if state_path.exists():
+		return project_name, state_path, stats_path, manuscript_path
+
+	seed = Prompt.ask("Initial story seed")
+	project_dir.mkdir(parents=True, exist_ok=True)
+	init_state = dict(DEFAULT_STATE)
+	init_state["manuscript_file"] = str(manuscript_path).replace("\\", "/")
+	init_state["initial_seed"] = seed
+	init_state["user_feedback"] = seed
+	write_json(state_path, init_state)
+	write_json(
+		stats_path,
+		{"loops": [], "total_input_tokens": 0, "total_output_tokens": 0, "total_time_seconds": 0.0, "total_tool_calls": 0},
+	)
+	write_manuscript(manuscript_path, "")
+
+	return project_name, state_path, stats_path, manuscript_path
+
+
+def summarize_keys(ai_state: dict[str, Any]) -> dict[str, str]:
+	result: dict[str, str] = {}
+	for key, value in ai_state.items():
+		if isinstance(value, dict):
+			result[key] = f"object ({len(value)} keys)"
+		elif isinstance(value, list):
+			result[key] = f"array ({len(value)} items)"
+		elif isinstance(value, str):
+			result[key] = f"string ({count_words(value)} words)"
+		elif isinstance(value, bool):
+			result[key] = "boolean"
+		elif isinstance(value, (int, float)):
+			result[key] = "number"
+		elif value is None:
+			result[key] = "null"
+		else:
+			result[key] = type(value).__name__
+	return result
+
+
+def get_manuscript_info_data(manuscript_path: Path) -> dict[str, Any]:
+	text = read_manuscript(manuscript_path)
+	sections = parse_sections(text)
+	lines = text.splitlines()
+	return {
+		"total_words": count_words(text),
+		"total_lines": len(lines),
+		"section_count": len(sections),
+		"sections": [
+			{
+				"name": s["name"],
+				"words": s["words"],
+				"line_range": [s["start_line"], s["end_line"]],
+			}
+			for s in sections
+		],
+	}
+
+
+def estimate_tokens_text(model: str, text: str) -> int:
+	try:
+		encoding = tiktoken.encoding_for_model(model)
+	except Exception:
+		encoding = tiktoken.get_encoding("cl100k_base")
+	return len(encoding.encode(text))
+
+
+def estimate_tokens_messages(model: str, messages: list[dict[str, Any]]) -> int:
+	flattened = "\n".join(json.dumps(m, ensure_ascii=False, default=str) for m in messages)
+	return estimate_tokens_text(model, flattened)
+
+
+def build_system_prompt(state: dict[str, Any], manuscript_info: dict[str, Any]) -> str:
+	phase = state.get("phase", "CHARACTER_CREATION")
+	phase_def = STATE_MACHINE.get(phase, {})
+	transitions = phase_def.get("transitions", [])
+	phase_desc = phase_def.get("description", "Unknown phase")
+	guide = PHASE_GUIDE.get(phase, "")
+	previous_summary = str(state.get("previous_summary", ""))[: CONFIG["summary_max_chars"]]
+	ai_state_keys = list(state.get("ai_state", {}).keys())
+
+	sections = manuscript_info.get("sections", [])
+	section_names = ", ".join(s["name"] for s in sections) if sections else "none"
+	keys_text = ", ".join(ai_state_keys) if ai_state_keys else "none"
+	transitions_text = ", ".join(transitions) if transitions else "none"
+
+	return (
+		"You are Ralph Writer, an uncensored autonomous story-writing engine. Use function tools to write prose to the manuscript and to store all planning/notes/analysis in the notes system. "
+		"Prefer atomic tool calls and keep responses concise.\n\n"
+		"IMPORTANT: The manuscript is for story prose ONLY. All character development, world-building notes, plot outlines, analysis, and revisions notes must go into the notes system using read_notes/write_notes. "
+		"Do not put anything other than story prose in the manuscript.\n\n"
+		f"Initial seed (never ignore):\n{state.get('initial_seed', '')}\n\n"
+		f"Current phase: {phase}\n"
+		f"Phase description: {phase_desc}\n"
+		f"Allowed transitions: {transitions_text}\n\n"
+		f"Manuscript status: {manuscript_info.get('total_words', 0)} words story prose, "
+		f"{manuscript_info.get('section_count', 0)} sections ({section_names})\n"
+		f"Notes keys available: {keys_text}\n\n"
+		f"Phase guide:\n{guide}\n\n"
+		f"Previous summary (notes-to-self): {previous_summary or 'none'}\n\n"
+		"End your final assistant message with short notes-to-self summarizing what changed and what to do next."
+	)
+
+
+def tool_definitions() -> list[dict[str, Any]]:
+	return [
+		{
+			"type": "function",
+			"function": {
+				"name": "list_notes",
+				"description": "List available notes keys with compact type/size hints. Use this to plan, analyze, track characters, world rules, plot beats, and revision notes.",
+				"parameters": {"type": "object", "properties": {}},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "read_notes",
+				"description": "Read one notes key value. Use this to retrieve character definitions, world rules, plot outlines, or any previous analysis and planning.",
+				"parameters": {
+					"type": "object",
+					"properties": {"key": {"type": "string", "description": "Notes key"}},
+					"required": ["key"],
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "write_notes",
+				"description": "Write JSON-serializable data to one notes key. Store character definitions, world rules, plot outlines, beat tracking, revision notes, and all planning/analysis here—never in the manuscript.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"key": {"type": "string", "description": "Notes key"},
+						"data": {
+							"type": ["object", "array", "string", "number", "boolean", "null"],
+							"description": "JSON value to store",
+						},
+					},
+					"required": ["key", "data"],
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "delete_notes",
+				"description": "Delete one key from notes.",
+				"parameters": {
+					"type": "object",
+					"properties": {"key": {"type": "string", "description": "Notes key"}},
+					"required": ["key"],
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "get_manuscript_info",
+				"description": "Get manuscript TOC, word counts, and section line ranges without full content.",
+				"parameters": {"type": "object", "properties": {}},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "read_manuscript_section",
+				"description": "Read one named manuscript section's content.",
+				"parameters": {
+					"type": "object",
+					"properties": {"section_name": {"type": "string", "description": "Section name"}},
+					"required": ["section_name"],
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "read_manuscript_tail",
+				"description": "Read the last N words from manuscript for continuation context.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"word_count": {
+							"type": "integer",
+							"description": "How many words from the end",
+							"default": 300,
+						}
+					},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "search_manuscript",
+				"description": "Search manuscript text and return matching lines with surrounding context.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"query": {"type": "string", "description": "Text or regex to find"},
+						"context_lines": {
+							"type": "integer",
+							"description": "Lines of context around each match",
+							"default": 2,
+						},
+					},
+					"required": ["query"],
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "append_to_manuscript",
+				"description": "Append prose to the end of manuscript.",
+				"parameters": {
+					"type": "object",
+					"properties": {"content": {"type": "string", "description": "Text to append"}},
+					"required": ["content"],
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "create_section",
+				"description": "Create a new named section with markers.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"name": {"type": "string", "description": "Section name"},
+						"content": {"type": "string", "description": "Section content"},
+					},
+					"required": ["name", "content"],
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "replace_section",
+				"description": "Replace content of an existing named section while preserving markers.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"name": {"type": "string", "description": "Section name"},
+						"content": {"type": "string", "description": "Replacement content"},
+					},
+					"required": ["name", "content"],
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "delete_section",
+				"description": "Delete a named section and its markers.",
+				"parameters": {
+					"type": "object",
+					"properties": {"name": {"type": "string", "description": "Section name"}},
+					"required": ["name"],
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "change_phase",
+				"description": "Transition to a valid next phase according to state machine.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"new_phase": {"type": "string", "description": "Target phase"},
+						"reason": {"type": "string", "description": "Why transition now"},
+					},
+					"required": ["new_phase", "reason"],
+				},
+			},
+		},
+	]
+
+
+def execute_function(
+	name: str,
+	arguments: dict[str, Any],
+	state: dict[str, Any],
+	state_path: Path,
+	manuscript_path: Path,
+) -> Any:
+	ai_state = state.setdefault("ai_state", {})
+
+	def available_sections() -> list[str]:
+		return [s["name"] for s in parse_sections(read_manuscript(manuscript_path))]
+
+	try:
+		if name == "list_notes":
+			return summarize_keys(ai_state)
+
+		if name == "read_notes":
+			key = arguments["key"]
+			if key not in ai_state:
+				return {"error": f"notes key '{key}' not found", "available": sorted(ai_state.keys())}
+			return ai_state[key]
+
+		if name == "write_notes":
+			key = arguments["key"]
+			ai_state[key] = arguments.get("data")
+			write_json(state_path, state)
+			return f"wrote notes key '{key}' (persisted to file)"
+
+		if name == "delete_notes":
+			key = arguments["key"]
+			if key not in ai_state:
+				return {"error": f"notes key '{key}' not found", "available": sorted(ai_state.keys())}
+			del ai_state[key]
+			write_json(state_path, state)
+			return f"deleted notes key '{key}' (persisted to file)"
+
+		if name == "get_manuscript_info":
+			return get_manuscript_info_data(manuscript_path)
+
+		if name == "read_manuscript_section":
+			section_name = arguments["section_name"]
+			text = read_manuscript(manuscript_path)
+			sections = parse_sections(text)
+			for section in sections:
+				if section["name"] == section_name:
+					return section["content"]
+			return {"error": f"section '{section_name}' not found", "available": [s["name"] for s in sections]}
+
+		if name == "read_manuscript_tail":
+			word_count = int(arguments.get("word_count", 300))
+			text = read_manuscript(manuscript_path).strip()
+			words = text.split()
+			tail = " ".join(words[-max(word_count, 1) :])
+			return tail
+
+		if name == "search_manuscript":
+			query = arguments["query"]
+			context_lines = max(0, int(arguments.get("context_lines", 2)))
+			text = read_manuscript(manuscript_path)
+			lines = text.splitlines()
+			matches = []
+			for idx, line in enumerate(lines):
+				if re.search(query, line, flags=re.IGNORECASE):
+					start = max(0, idx - context_lines)
+					end = min(len(lines), idx + context_lines + 1)
+					snippet = "\n".join(lines[start:end])
+					matches.append({"line": idx + 1, "context": snippet})
+			return {"query": query, "matches": matches[:20], "count": len(matches)}
+
+		if name == "append_to_manuscript":
+			content = arguments["content"].strip("\n")
+			existing = read_manuscript(manuscript_path)
+			if existing and not existing.endswith("\n\n"):
+				existing = existing.rstrip("\n") + "\n\n"
+			updated = existing + content + "\n"
+			write_manuscript(manuscript_path, updated)
+			return f"appended {count_words(content)} words (total: {count_words(updated)})"
+
+		if name == "create_section":
+			section_name = arguments["name"].strip()
+			content = arguments["content"].strip("\n")
+			text = read_manuscript(manuscript_path)
+			sections = parse_sections(text)
+			if section_name in [s["name"] for s in sections]:
+				return {
+					"error": f"section '{section_name}' already exists",
+					"available": [s["name"] for s in sections],
+				}
+			block = (
+				f"<!-- SECTION: {section_name} -->\n"
+				f"{content}\n"
+				f"<!-- END SECTION: {section_name} -->\n"
+			)
+			if text and not text.endswith("\n\n"):
+				text = text.rstrip("\n") + "\n\n"
+			write_manuscript(manuscript_path, text + block)
+			return f"created section '{section_name}' ({count_words(content)} words)"
+
+		if name == "replace_section":
+			section_name = arguments["name"].strip()
+			content = arguments["content"].strip("\n")
+			text = read_manuscript(manuscript_path)
+			sections = parse_sections(text)
+			target = next((s for s in sections if s["name"] == section_name), None)
+			if not target:
+				return {"error": f"section '{section_name}' not found", "available": [s["name"] for s in sections]}
+			replacement = (
+				f"<!-- SECTION: {section_name} -->\n"
+				f"{content}\n"
+				f"<!-- END SECTION: {section_name} -->"
+			)
+			updated = text[: target["start"]] + replacement + text[target["end"] :]
+			write_manuscript(manuscript_path, updated)
+			return f"replaced section '{section_name}' ({count_words(content)} words)"
+
+		if name == "delete_section":
+			section_name = arguments["name"].strip()
+			text = read_manuscript(manuscript_path)
+			sections = parse_sections(text)
+			target = next((s for s in sections if s["name"] == section_name), None)
+			if not target:
+				return {"error": f"section '{section_name}' not found", "available": [s["name"] for s in sections]}
+			updated = (text[: target["start"]] + text[target["end"] :]).strip("\n") + "\n"
+			write_manuscript(manuscript_path, updated)
+			return f"deleted section '{section_name}'"
+
+		if name == "change_phase":
+			new_phase = arguments["new_phase"].strip()
+			reason = arguments["reason"].strip()
+			current_phase = state.get("phase", "CHARACTER_CREATION")
+
+			if new_phase not in STATE_MACHINE:
+				return {"error": f"unknown phase '{new_phase}'", "available": sorted(STATE_MACHINE.keys())}
+
+			allowed = STATE_MACHINE.get(current_phase, {}).get("transitions", [])
+			if new_phase not in allowed:
+				return {
+					"error": f"invalid transition from {current_phase} to {new_phase}",
+					"available": allowed,
+				}
+
+			state["phase"] = new_phase
+			write_json(state_path, state)
+			return f"phase changed from {current_phase} to {new_phase}: {reason} (persisted to file)"
+
+		return {"error": f"unknown function '{name}'"}
+	except Exception as exc:
+		if name in {"read_manuscript_section", "replace_section", "delete_section"}:
+			return {"error": str(exc), "available": available_sections()}
+		return {"error": str(exc)}
+
+
+def show_status(project_name: str, state: dict[str, Any], manuscript_info: dict[str, Any]) -> None:
+	phase = state.get("phase", "CHARACTER_CREATION")
+	phase_def = STATE_MACHINE.get(phase, {"description": "Unknown", "transitions": []})
+	transitions = phase_def.get("transitions", [])
+	transitions_text = ", ".join(transitions) if transitions else "none"
+
+	status_text = (
+		f"Project: [bold]{project_name}[/bold]\n"
+		f"Phase: [yellow]{phase}[/yellow]\n"
+		f"Description: {phase_def.get('description', '')}\n"
+		f"Allowed transitions: {transitions_text}\n"
+		f"Manuscript words: {manuscript_info.get('total_words', 0)}"
+	)
+	console.print(Panel(status_text, title="Ralph Writer Status", border_style="blue"))
+
+
+def show_stats_table(stats: dict[str, Any]) -> None:
+	loops = stats.get("loops", [])
+	recent = loops[-5:]
+
+	table = Table(title="Recent Loops", show_lines=False)
+	table.add_column("#", justify="right")
+	table.add_column("Phase")
+	table.add_column("Status")
+	table.add_column("In")
+	table.add_column("Out")
+	table.add_column("Tools")
+	table.add_column("Seconds", justify="right")
+
+	start_num = len(loops) - len(recent) + 1
+	for i, row in enumerate(recent):
+		table.add_row(
+			str(start_num + i),
+			str(row.get("phase", "")),
+			str(row.get("status", "")),
+			str(row.get("in_tokens", 0)),
+			str(row.get("out_tokens", 0)),
+			str(row.get("tool_calls", 0)),
+			f"{row.get('duration_seconds', 0):.2f}",
+		)
+
+	console.print(table)
+	total_in = stats.get("total_input_tokens", 0)
+	total_out = stats.get("total_output_tokens", 0)
+	total_time = float(stats.get("total_time_seconds", 0.0))
+	total_tools = stats.get("total_tool_calls", 0)
+	if total_time > 60:
+		time_text = f"{total_time / 60:.1f} min"
+	else:
+		time_text = f"{total_time:.1f} sec"
+	console.print(
+		f"[green]Totals:[/green] in={total_in} out={total_out} burn={total_in + total_out} tools={total_tools} time={time_text}"
+	)
+
+
+def append_stats(stats_path: Path, loop_row: dict[str, Any]) -> dict[str, Any]:
+	stats = read_json(
+		stats_path,
+		{"loops": [], "total_input_tokens": 0, "total_output_tokens": 0, "total_time_seconds": 0.0, "total_tool_calls": 0},
+	)
+	stats["loops"].append(loop_row)
+	stats["total_input_tokens"] += int(loop_row.get("in_tokens", 0))
+	stats["total_output_tokens"] += int(loop_row.get("out_tokens", 0))
+	stats["total_time_seconds"] += float(loop_row.get("duration_seconds", 0.0))
+	stats["total_tool_calls"] += int(loop_row.get("tool_calls", 0))
+	write_json(stats_path, stats)
+	return stats
+
+def build_user_message(state: dict[str, Any]) -> str:
+	seed = str(state.get("initial_seed", "")).strip()
+	feedback = str(state.get("user_feedback", "")).strip()
+	if feedback:
+		return f"Initial seed:\n{seed}\n\nLatest user feedback:\n{feedback}"
+	return f"Initial seed:\n{seed}\n\nNo additional user feedback. Continue autonomously."
+
+
+def run_iteration(
+	client: OpenAI,
+	project_name: str,
+	state_path: Path,
+	stats_path: Path,
+	manuscript_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+	state = read_json(state_path, dict(DEFAULT_STATE))
+	manuscript_info = get_manuscript_info_data(manuscript_path)
+	show_status(project_name, state, manuscript_info)
+
+	start_time = time.time()
+	total_in_tokens = 0
+	total_out_tokens = 0
+	total_tool_calls = 0
+	final_text = ""
+	status = "Success"
+
+	system_prompt = build_system_prompt(state, manuscript_info)
+	user_message = build_user_message(state)
+	messages: list[dict[str, Any]] = [
+		{"role": "system", "content": system_prompt},
+		{"role": "user", "content": user_message},
+	]
+
+	for _ in range(CONFIG["max_tool_turns"]):
+		if CONFIG["max_context_tokens"] > 0:
+			current_context_tokens = estimate_tokens_messages(CONFIG["model"], messages)
+			if current_context_tokens >= CONFIG["max_context_tokens"]:
+				status = (
+					f"Stopped early: context limit reached "
+					f"({current_context_tokens}/{CONFIG['max_context_tokens']} tokens)"
+				)
+				console.print(f"[yellow]{status}[/yellow]")
+				break
+
+		try:
+			response = client.chat.completions.create(
+				model=CONFIG["model"],
+				messages=messages,
+				tools=tool_definitions(),
+				tool_choice="auto",
+			)
+		except Exception as exc:
+			status = f"Failed: {exc}"
+			break
+
+		usage = response.usage
+		if usage:
+			total_in_tokens += int(usage.prompt_tokens or 0)
+			total_out_tokens += int(usage.completion_tokens or 0)
+
+		message = response.choices[0].message
+		assistant_text = message.content or ""
+		if assistant_text:
+			final_text = assistant_text
+			console.print(Panel(assistant_text, title="Assistant", border_style="magenta"))
+
+		assistant_payload: dict[str, Any] = {
+			"role": "assistant",
+			"content": assistant_text,
+		}
+
+		if message.tool_calls:
+			assistant_payload["tool_calls"] = [
+				{
+					"id": tc.id,
+					"type": tc.type,
+					"function": {
+						"name": tc.function.name,
+						"arguments": tc.function.arguments,
+					},
+				}
+				for tc in message.tool_calls
+			]
+
+		messages.append(assistant_payload)
+
+		if not message.tool_calls:
+			break
+
+		stop_due_to_tool_limit = False
+		for tool_call in message.tool_calls:
+			if CONFIG["max_tool_calls_per_iteration"] > 0 and total_tool_calls >= CONFIG["max_tool_calls_per_iteration"]:
+				status = (
+					f"Stopped early: tool call limit reached "
+					f"({total_tool_calls}/{CONFIG['max_tool_calls_per_iteration']})"
+				)
+				console.print(f"[yellow]{status}[/yellow]")
+				stop_due_to_tool_limit = True
+				break
+
+			total_tool_calls += 1
+			fn_name = tool_call.function.name
+			raw_args = tool_call.function.arguments or "{}"
+			try:
+				args = json.loads(raw_args)
+				if not isinstance(args, dict):
+					args = {}
+			except Exception:
+				args = {}
+
+			result = execute_function(fn_name, args, state, state_path, manuscript_path)
+			result_text = json.dumps(result, ensure_ascii=False)
+
+			console.print(
+				Panel(
+					f"[bold]Tool:[/bold] {fn_name}\n[bold]Args:[/bold] {json.dumps(args, ensure_ascii=False)}\n"
+					f"[bold]Result:[/bold] {result_text}",
+					title="Tool Call",
+					border_style="cyan",
+				)
+			)
+
+			messages.append(
+				{
+					"role": "tool",
+					"tool_call_id": tool_call.id,
+					"name": fn_name,
+					"content": result_text,
+				}
+			)
+
+		if stop_due_to_tool_limit:
+			break
+
+	if total_in_tokens == 0 and total_out_tokens == 0:
+		total_in_tokens = estimate_tokens_messages(CONFIG["model"], messages)
+		total_out_tokens = estimate_tokens_text(CONFIG["model"], final_text)
+
+	state["previous_summary"] = final_text[: CONFIG["summary_max_chars"]]
+	state["user_feedback"] = ""
+	write_json(state_path, state)
+
+	loop_row = {
+		"timestamp": now_iso(),
+		"phase": state.get("phase", "UNKNOWN"),
+		"status": status,
+		"in_tokens": total_in_tokens,
+		"out_tokens": total_out_tokens,
+		"duration_seconds": round(time.time() - start_time, 3),
+		"tool_calls": total_tool_calls,
+	}
+	stats = append_stats(stats_path, loop_row)
+	show_stats_table(stats)
+
+	if status.startswith("Failed"):
+		time.sleep(3)
+
+	return state, loop_row
+
+
+def should_stop(state: dict[str, Any]) -> bool:
+	phase = state.get("phase")
+	if CONFIG["stop_only_on_complete"]:
+		return phase == "READY_FOR_HUMAN"
+	return phase == "READY_FOR_HUMAN"
+
+
+def main() -> None:
+	client = OpenAI(base_url=CONFIG["base_url"], api_key=CONFIG["api_key"])
+	project_name, state_path, stats_path, manuscript_path = choose_or_create_project()
+
+	console.print(
+		Panel(
+			f"Model: {CONFIG['model']}\nBase URL: {CONFIG['base_url']}\n"
+			f"Auto-pilot: {CONFIG['auto_pilot']}",
+			title="Session Config",
+			border_style="green",
+		)
+	)
+
+	while True:
+		try:
+			state, _ = run_iteration(client, project_name, state_path, stats_path, manuscript_path)
+		except KeyboardInterrupt:
+			console.print("\n[yellow]Interrupted by user.[/yellow]")
+			break
+		except Exception as exc:
+			console.print(f"[red]Fatal iteration error:[/red] {exc}")
+			time.sleep(3)
+			continue
+
+		if should_stop(state):
+			console.print("[bold green]Reached READY_FOR_HUMAN. Session complete.[/bold green]")
+			break
+
+		if CONFIG["auto_pilot"]:
+			time.sleep(2)
+			continue
+
+		feedback = Prompt.ask("Optional feedback (blank to continue)", default="").strip()
+		if feedback:
+			current_state = read_json(state_path, dict(DEFAULT_STATE))
+			current_state["user_feedback"] = feedback
+			write_json(state_path, current_state)
+
+
 if __name__ == "__main__":
-    console.clear()
-    console.print(Panel("[bold green]WELCOME TO THE RALPH LOOP STORY ENGINE[/bold green]\nFully Local, Fully Autonomous."))
-
-    # Project Selection Logic
-    projects = list_projects()
-    if projects:
-        console.print("[bold yellow]Existing Projects:[/bold yellow]")
-        for i, p in enumerate(projects):
-            console.print(f" {i+1}. {p}")
-        console.print(" n. [Create New Project]")
-        
-        choice = Prompt.ask("Choose a project", choices=[str(i+1) for i in range(len(projects))] + ["n"])
-        if choice == "n":
-            project_name = Prompt.ask("Enter new project name").strip().replace(" ", "_")
-        else:
-            project_name = projects[int(choice)-1]
-    else:
-        project_name = Prompt.ask("No projects found. Enter new project name").strip().replace(" ", "_")
-
-    state_p, stats_p, manus_p = setup_project(project_name)
-    
-    with open(state_p, "r") as f: 
-        state = json.load(f)
-    
-    # Migrate older projects: ensure previous_summary field exists
-    if "previous_summary" not in state:
-        state["previous_summary"] = ""
-    
-    # Validate and fix phase if needed
-    if state["phase"] not in STATE_MACHINE:
-        console.print(f"[yellow]Warning: Unknown phase '{state['phase']}'. Resetting to CHARACTER_CREATION.[/yellow]")
-        state["phase"] = "CHARACTER_CREATION"
-    
-    # Check if already in terminal state
-    if state["phase"] == "READY_FOR_HUMAN":
-        console.print("[bold green]✨ This project is marked as complete! ✨[/bold green]")
-        console.print(f"[dim]Manuscript: {manus_p}[/dim]")
-        if Confirm.ask("Do you want to continue working on it anyway?"):
-            state["phase"] = "REVISION"
-            console.print("[yellow]Moving back to REVISION phase...[/yellow]")
-        else:
-            sys.exit(0)
-
-    try:
-        while True:
-            raw_text, in_t, out_t, duration, tool_calls = run_iteration(state, project_name, manus_p)
-            
-            if raw_text is None:
-                # Log failed attempt with tokens that were used
-                current_stats = update_logs(stats_p, {
-                    "timestamp": str(datetime.now()),
-                    "phase": state["phase"],
-                    "status": "Failed: Connection Error",
-                    "in_tokens": in_t,
-                    "out_tokens": out_t,
-                    "duration_seconds": duration
-                })
-                show_stats(current_stats)
-                console.print("[yellow]⚠ Connection error. Retrying in 3 seconds...[/yellow]")
-                time.sleep(3)  # Wait before retrying
-                continue
-
-            status = "Success"
-            
-            # Check if we've reached terminal state
-            if state["phase"] == "READY_FOR_HUMAN":
-                console.print("\n[bold green]✨ Story is ready for human review! ✨[/bold green]")
-                console.print(f"[dim]Manuscript saved to: {manus_p}[/dim]")
-                status = "Completed"
-            
-            # Display tool call summary
-            if tool_calls:
-                console.print(f"\n[dim]🔧 Made {len(tool_calls)} tool call(s) this iteration[/dim]")
-            
-            state["user_feedback"] = ""  # Clear after successful loop
-
-            # Log Stats
-            current_stats = update_logs(stats_p, {
-                "timestamp": str(datetime.now()),
-                "phase": state["phase"],
-                "status": status,
-                "in_tokens": in_t,
-                "out_tokens": out_t,
-                "duration_seconds": duration
-            })
-            
-            with open(state_p, "w") as f:
-                json.dump(state, f, indent=4)
-            
-            show_stats(current_stats)
-            
-            # Break if story is complete
-            if state["phase"] == "READY_FOR_HUMAN":
-                break
-
-            # Control Flow
-            if not CONFIG["auto_pilot"]:
-                feedback = console.input("\n[yellow]Paused. Feedback (or Enter to loop): [/yellow]")
-                if feedback.lower() == 'exit':
-                    if CONFIG["stop_only_on_complete"]:
-                        console.print("[yellow]Cannot exit - stop_only_on_complete mode requires reaching READY_FOR_HUMAN. Use Ctrl+C to force stop.[/yellow]")
-                    else:
-                        break
-                if feedback: state["user_feedback"] = feedback
-            else:
-                # 2-second window to hit Ctrl+C or prepare to type an interruption
-                time.sleep(2) 
-
-    except KeyboardInterrupt:
-        console.print("\n[bold red]Stopping Engine... State saved.[/bold red]")
+	main()
