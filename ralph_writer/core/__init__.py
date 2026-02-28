@@ -2,5 +2,6 @@
 
 from .project import Project
 from .state import ProjectState
+from .result import IterationResult
 
-__all__ = ["Project", "ProjectState"]
+__all__ = ["Project", "ProjectState", "IterationResult"]
