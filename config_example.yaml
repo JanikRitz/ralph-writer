@@ -1,4 +1,5 @@
 version: "1.0"
+description: "Default local LM Studio configuration for balanced autonomous writing loops."
 default_phase: CHARACTER_CREATION
 
 settings:

@@ -51,6 +51,15 @@ Ralph Writer is an autonomous AI story-writing engine that uses a state machine 
 └──────────────────┘    └──────────────────┘
 ```
 
+### CLI Discovery & Inspection Commands
+
+The CLI should include lightweight discovery commands that are safe to run without starting a writing session:
+
+- `--list-configs` - Show discovered config files with key metadata columns (including `description`)
+- `--show-config <config-name-or-path>` - Show one structured, readable config summary (header metadata + settings + phase table) and exit
+- `--info <project>` - Show detailed status and metrics for one project
+- `--list-project` / `--list-projects` - Show compact status rows for all projects
+
 ## Core Components
 
 ### 1. Configuration System
@@ -73,6 +82,14 @@ CONFIG = {
 - Auto-pilot controls whether loop pauses for user input
 - Stop-only-on-complete prevents premature termination
 - Stop-after-phase-change prevents one iteration from spanning multiple phase loops
+- Configs may include optional top-level metadata like `description` for discovery UX
+
+**Optional Config Metadata Example:**
+```yaml
+version: "1.0"
+description: "Primary local profile for long-form drafting"
+default_phase: CHARACTER_CREATION
+```
 
 ### 2. State Machine
 
