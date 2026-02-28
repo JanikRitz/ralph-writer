@@ -451,17 +451,6 @@ def main() -> None:
 		show_config_content(config_path, load_raw_config(config_path))
 		return
 
-	config_path = resolve_config_path(args)
-	if config_path is None:
-		return
-
-	phase_config = load_phase_config(config_path)
-	state_machine = phase_config.state_machine
-	phase_guide = phase_config.phase_guide
-	default_phase = phase_config.default_phase
-	system_prompt_template = phase_config.system_prompt_template
-	runtime_config = RuntimeSettings.from_sources(phase_config.settings).to_dict()
-
 	if args.info_project:
 		project = get_project(args.info_project)
 		if not project:
@@ -476,10 +465,23 @@ def main() -> None:
 
 		state = project.state.to_dict()
 		manuscript_info = get_manuscript_info_data(project.manuscript_path)
-		show_status(project.name, state, manuscript_info, state_machine)
+		console.print(f"[bold]Phase:[/bold] {state.get('phase', '-')}")
+		console.print(f"[bold]Words:[/bold] {manuscript_info.get('total_words', 0)}")
+		console.print(f"[bold]Sections:[/bold] {manuscript_info.get('section_count', 0)}")
 		stats = project.get_stats()
 		show_stats_table(stats, max_entries=0)
 		return
+
+	config_path = resolve_config_path(args)
+	if config_path is None:
+		return
+
+	phase_config = load_phase_config(config_path)
+	state_machine = phase_config.state_machine
+	phase_guide = phase_config.phase_guide
+	default_phase = phase_config.default_phase
+	system_prompt_template = phase_config.system_prompt_template
+	runtime_config = RuntimeSettings.from_sources(phase_config.settings).to_dict()
 
 	client = OpenAI(base_url=runtime_config["base_url"], api_key=runtime_config["api_key"])
 	project = choose_or_create_project(default_phase)
