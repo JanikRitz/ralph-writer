@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -8,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
+import shutil
 import tiktoken
 import yaml
 from openai import OpenAI
@@ -16,6 +17,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
+from PIL import Image
 
 
 PROJECTS_DIR = Path("projects")
@@ -26,7 +28,7 @@ CONFIG: dict[str, Any] = {
 	"auto_pilot": os.getenv("RALPH_AUTO_PILOT", "true").lower() == "true",
 	"stop_only_on_complete": os.getenv("RALPH_STOP_ONLY_ON_COMPLETE", "true").lower() == "true",
 	"stop_after_phase_change": os.getenv("RALPH_STOP_AFTER_PHASE_CHANGE", "true").lower() == "true",
-	"max_context_tokens": int(os.getenv("RALPH_MAX_CONTEXT_TOKENS", "16000")),
+	"max_context_tokens": int(os.getenv("RALPH_MAX_CONTEXT_TOKENS", "64000")),
 	"max_tool_calls_per_iteration": int(os.getenv("RALPH_MAX_TOOL_CALLS_PER_ITERATION", "12")),
 	"tool_args_max_chars": int(os.getenv("RALPH_TOOL_ARGS_MAX_CHARS", "240")),
 	"tool_result_max_chars": int(os.getenv("RALPH_TOOL_RESULT_MAX_CHARS", "320")),
@@ -79,6 +81,7 @@ def get_default_state(phase: str | None = None) -> dict[str, Any]:
 		"user_feedback": "",
 		"previous_summary": "",
 		"ai_state": {},
+		"image_paths": [],
 	}
 
 SECTION_PATTERN = re.compile(
@@ -148,6 +151,141 @@ def read_manuscript(path: Path) -> str:
 	return path.read_text(encoding="utf-8")
 
 
+def extract_image_refs(text: str) -> list[str]:
+	"""Extract image references from text.
+	
+	Supports formats:
+	- #path/to/image.png (simple paths)
+	- #"path with spaces/image.png" (quoted paths)
+	"""
+	images: list[str] = []
+	# Match quoted paths: #"..." 
+	for match in re.finditer(r'#"([^"]+)"', text):
+		path = match.group(1).strip()
+		if path:
+			images.append(path)
+	# Match unquoted paths: #path/to/file (no spaces)
+	for match in re.finditer(r'#([^\s"#]+)', text):
+		path = match.group(1).strip()
+		if path and not path.startswith('"'):
+			images.append(path)
+	return images
+
+
+def validate_image_paths(image_refs: list[str], base_dir: Path) -> tuple[list[str], list[str]]:
+    """Validate and copy image files into project directory.
+    
+    Copies images from current working directory or source location into base_dir.
+    Returns (valid_paths_in_project, error_messages).
+    """
+    valid_paths: list[str] = []
+    errors: list[str] = []
+    
+    for ref in image_refs:
+        # Source: look for image relative to current working directory
+        src_path = Path(ref)
+        if not src_path.is_absolute():
+            src_path = Path.cwd() / src_path
+        
+        if not src_path.exists():
+            errors.append(f"Image not found at source: {ref}")
+            continue
+        
+        if not src_path.is_file():
+            errors.append(f"Not a file: {ref}")
+            continue
+        
+        try:
+            # Verify it's a supported image format
+            if src_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+                errors.append(f"Unsupported format: {ref}")
+                continue
+            
+            # Destination: preserve relative path structure in project directory
+            dest_path = base_dir / ref
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Copy file into project directory
+            shutil.copy2(src_path, dest_path)
+            valid_paths.append(ref)
+            
+            # Scale down image to reduce token usage for vision API
+            try:
+                img = Image.open(dest_path)
+                
+                # Scale down to max 1024px on longest side
+                max_size = 512
+                img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                
+                # Save scaled image back, using quality 85 for jpg/webp
+                if dest_path.suffix.lower() in {".jpg", ".jpeg"}:
+                    img.save(dest_path, quality=85, optimize=True)
+                elif dest_path.suffix.lower() == ".webp":
+                    img.save(dest_path, quality=85)
+                else:
+                    img.save(dest_path, optimize=True)
+            
+            except ImportError:
+                errors.append(f"Pillow not installed; skipping image scaling for {ref}")
+                # Continue anyway—image is copied but not scaled
+            except Exception as e:
+                errors.append(f"Warning: Could not scale image {ref}: {e}")
+                # Continue anyway—image is copied but not scaled
+            
+        except Exception as e:
+            errors.append(f"Error copying {ref}: {e}")
+    
+    return valid_paths, errors
+
+
+def encode_image_to_base64(path: Path) -> str:
+	"""Read image file and encode to base64 data URL."""
+	with open(path, "rb") as img_file:
+		b64 = base64.b64encode(img_file.read()).decode("utf-8")
+	# Determine MIME type from extension
+	suffix = path.suffix.lower()
+	mime_map = {
+		".png": "image/png",
+		".jpg": "image/jpeg",
+		".jpeg": "image/jpeg",
+		".gif": "image/gif",
+		".webp": "image/webp",
+		".bmp": "image/bmp",
+	}
+	mime_type = mime_map.get(suffix, "image/png")
+	return f"data:{mime_type};base64,{b64}"
+
+
+def build_vision_message_blocks(text: str, image_refs: list[str], base_dir: Path) -> list[dict[str, Any]]:
+	"""Build message content blocks for vision API.
+	
+	Returns list of blocks: [{"type": "text", ...}, {"type": "image_url", ...}]
+	"""
+	content_blocks: list[dict[str, Any]] = []
+	
+	# Add text block
+	if text.strip():
+		content_blocks.append({
+			"type": "text",
+			"text": text,
+		})
+	
+	# Add image blocks
+	for ref in image_refs:
+		try:
+			img_path = base_dir / ref
+			if img_path.exists() and img_path.is_file():
+				img_url = encode_image_to_base64(img_path)
+				content_blocks.append({
+					"type": "image_url",
+					"image_url": {"url": img_url},
+				})
+		except Exception as e:
+			console.print(f"[yellow]Warning: Could not load image {ref}: {e}[/yellow]")
+	
+	return content_blocks
+
+
 def write_manuscript(path: Path, content: str) -> None:
 	path.parent.mkdir(parents=True, exist_ok=True)
 	path.write_text(content, encoding="utf-8")
@@ -173,12 +311,32 @@ def choose_or_create_project() -> tuple[str, Path, Path, Path]:
 	if state_path.exists():
 		return project_name, state_path, stats_path, manuscript_path
 
-	seed = Prompt.ask("Initial story seed")
+	seed = Prompt.ask("Initial story seed (use #path/to/image.png or #\"path with spaces.png\" for images)")
 	project_dir.mkdir(parents=True, exist_ok=True)
 	init_state = get_default_state()
 	init_state["manuscript_file"] = str(manuscript_path).replace("\\", "/")
 	init_state["initial_seed"] = seed
 	init_state["user_feedback"] = seed
+	
+	# Extract and validate images from seed
+	image_refs = extract_image_refs(seed)
+	if image_refs:
+		valid_images, errors = validate_image_paths(image_refs, project_dir)
+		if errors:
+			for err in errors:
+				console.print(f"[yellow]Warning: {err}[/yellow]")
+		init_state["image_paths"] = valid_images
+		if valid_images:
+			console.print(f"[green]Loaded {len(valid_images)} image(s) as context:[/green]")
+			for img_ref in valid_images:
+				img_path = project_dir / img_ref
+				if img_path.exists():
+					size_kb = img_path.stat().st_size / 1024
+					console.print(f"  • {img_ref} ({size_kb:.1f} KB)")
+				else:
+					console.print(f"  • {img_ref}")
+	else:
+		init_state["image_paths"] = []
 	write_json(state_path, init_state)
 	write_json(
 		stats_path,
@@ -703,12 +861,24 @@ def append_stats(stats_path: Path, loop_row: dict[str, Any]) -> dict[str, Any]:
 	write_json(stats_path, stats)
 	return stats
 
-def build_user_message(state: dict[str, Any]) -> str:
+def build_user_message(state: dict[str, Any], project_dir: Path) -> list[dict[str, Any]]:
+	"""Build user message with optional vision content blocks.
+	
+	Returns list of content blocks for API consumption.
+	"""
 	seed = str(state.get("initial_seed", "")).strip()
 	feedback = str(state.get("user_feedback", "")).strip()
+	
 	if feedback:
-		return f"Initial seed:\n{seed}\n\nLatest user feedback:\n{feedback}"
-	return f"Initial seed:\n{seed}\n\nNo additional user feedback. Continue autonomously."
+		message_text = f"Initial seed:\n{seed}\n\nLatest user feedback:\n{feedback}"
+	else:
+		message_text = f"Initial seed:\n{seed}\n\nNo additional user feedback. Continue autonomously."
+	
+	# Get image paths from state
+	image_paths = state.get("image_paths", [])
+	
+	# Build content blocks
+	return build_vision_message_blocks(message_text, image_paths, project_dir)
 
 
 def run_iteration(
@@ -731,10 +901,17 @@ def run_iteration(
 	status = "Success"
 
 	system_prompt = build_system_prompt(state, manuscript_info)
-	user_message = build_user_message(state)
+	project_dir = Path(state.get("manuscript_file", "")).parent
+	user_content_blocks = build_user_message(state, project_dir)
+	
+	# Show feedback if images are being provided
+	image_paths = state.get("image_paths", [])
+	if image_paths:
+		console.print(f"[cyan]Providing {len(image_paths)} image(s) as context[/cyan]")
+	
 	messages: list[dict[str, Any]] = [
 		{"role": "system", "content": system_prompt},
-		{"role": "user", "content": user_message},
+		{"role": "user", "content": user_content_blocks},
 	]
 
 	while True:
@@ -915,8 +1092,7 @@ def run_iteration(
 				and phase_after_call != phase_before_call
 			):
 				status = (
-					f"Stopped after phase change: {phase_before_call} -> {phase_after_call} "
-					"(next iteration starts with fresh context)"
+					f"Stopped after phase change: {phase_before_call} -> {phase_after_call}"
 				)
 				console.print(f"[yellow]{status}[/yellow]")
 				stop_due_to_phase_change = True
