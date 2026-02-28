@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -186,6 +187,15 @@ def choose_or_create_project() -> tuple[str, Path, Path, Path]:
 	write_manuscript(manuscript_path, "")
 
 	return project_name, state_path, stats_path, manuscript_path
+
+
+def get_project_paths(project_name: str) -> tuple[str, Path, Path, Path]:
+	name = safe_project_name(project_name)
+	project_dir = PROJECTS_DIR / name
+	state_path = project_dir / "state.json"
+	stats_path = project_dir / "stats.json"
+	manuscript_path = project_dir / "manuscript.md"
+	return name, state_path, stats_path, manuscript_path
 
 
 def summarize_keys(ai_state: dict[str, Any]) -> dict[str, str]:
@@ -633,9 +643,9 @@ def show_status(project_name: str, state: dict[str, Any], manuscript_info: dict[
 	console.print(Panel(status_text, title="Ralph Writer Status", border_style="blue"))
 
 
-def show_stats_table(stats: dict[str, Any]) -> None:
+def show_stats_table(stats: dict[str, Any], max_entries = 5) -> None:
 	loops = stats.get("loops", [])
-	recent = loops[-5:]
+	recent =  loops[-max_entries:] if max_entries > 0 else loops
 
 	table = Table(title="Recent Loops", show_lines=False)
 	table.add_column("#", justify="right")
@@ -951,7 +961,47 @@ def should_stop(state: dict[str, Any]) -> bool:
 	return phase == "READY_FOR_HUMAN"
 
 
+def parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(description="Ralph Writer")
+	parser.add_argument(
+		"--info",
+		dest="info_project",
+		help="Print status for an existing project and exit",
+	)
+	return parser.parse_args()
+
+
 def main() -> None:
+	args = parse_args()
+
+	if args.info_project:
+		project_name, state_path, stats_path, manuscript_path = get_project_paths(args.info_project)
+		if not state_path.exists():
+			console.print(f"[red]Project not found:[/red] {project_name}")
+			PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+			existing = sorted([p.name for p in PROJECTS_DIR.iterdir() if p.is_dir()])
+			if existing:
+				console.print(f"[cyan]Available projects:[/cyan] {', '.join(existing)}")
+			return
+
+		state = read_json(state_path, get_default_state())
+		manuscript_info = get_manuscript_info_data(manuscript_path)
+		show_status(project_name, state, manuscript_info)
+
+		if stats_path.exists():
+			stats = read_json(
+				stats_path,
+				{
+					"loops": [],
+					"total_input_tokens": 0,
+					"total_output_tokens": 0,
+					"total_time_seconds": 0.0,
+					"total_tool_calls": 0,
+				},
+			)
+			show_stats_table(stats, max_entries=0) # Show all entries
+		return
+
 	client = OpenAI(base_url=CONFIG["base_url"], api_key=CONFIG["api_key"])
 	project_name, state_path, stats_path, manuscript_path = choose_or_create_project()
 
