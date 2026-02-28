@@ -27,6 +27,9 @@ CONFIG: dict[str, Any] = {
 	"max_tool_turns": int(os.getenv("RALPH_MAX_TOOL_TURNS", "10")),
 	"max_context_tokens": int(os.getenv("RALPH_MAX_CONTEXT_TOKENS", "16000")),
 	"max_tool_calls_per_iteration": int(os.getenv("RALPH_MAX_TOOL_CALLS_PER_ITERATION", "0")),
+	"tool_args_max_chars": int(os.getenv("RALPH_TOOL_ARGS_MAX_CHARS", "240")),
+	"tool_result_max_chars": int(os.getenv("RALPH_TOOL_RESULT_MAX_CHARS", "320")),
+	"stream_console_updates": os.getenv("RALPH_STREAM_CONSOLE_UPDATES", "true").lower() == "true",
 	"summary_max_chars": 800,
 }
 
@@ -235,6 +238,23 @@ def estimate_tokens_text(model: str, text: str) -> int:
 def estimate_tokens_messages(model: str, messages: list[dict[str, Any]]) -> int:
 	flattened = "\n".join(json.dumps(m, ensure_ascii=False, default=str) for m in messages)
 	return estimate_tokens_text(model, flattened)
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+	if max_chars <= 0:
+		return text
+	if len(text) <= max_chars:
+		return text
+	remaining = len(text) - max_chars
+	return f"{text[:max_chars]}… (+{remaining} chars)"
+
+
+def compact_json(value: Any, max_chars: int) -> str:
+	try:
+		serialized = json.dumps(value, ensure_ascii=False)
+	except Exception:
+		serialized = str(value)
+	return truncate_text(serialized, max_chars)
 
 
 def build_system_prompt(state: dict[str, Any], manuscript_info: dict[str, Any]) -> str:
@@ -709,53 +729,125 @@ def run_iteration(
 				console.print(f"[yellow]{status}[/yellow]")
 				break
 
+		if CONFIG["stream_console_updates"]:
+			console.print("[dim]Thinking...[/dim]")
+
+		streamed_tool_calls: dict[int, dict[str, str]] = {}
+		streamed_tool_names_announced: set[int] = set()
+
 		try:
-			response = client.chat.completions.create(
+			with client.chat.completions.stream(
 				model=CONFIG["model"],
 				messages=messages,
 				tools=tool_definitions(),
 				tool_choice="auto",
-			)
+			) as stream:
+				if CONFIG["stream_console_updates"]:
+					console.print("[magenta]Assistant:[/magenta] ", end="")
+
+				for event in stream:
+					event_type = getattr(event, "type", "")
+
+					if event_type == "content.delta":
+						delta = getattr(event, "delta", "") or ""
+						if delta:
+							final_text += delta
+							if CONFIG["stream_console_updates"]:
+								console.print(delta, end="", markup=False, highlight=False)
+
+					elif event_type in {
+						"tool_calls.function.arguments.delta",
+						"tool_calls.function.arguments.done",
+					}:
+						index = int(getattr(event, "index", 0) or 0)
+						entry = streamed_tool_calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+
+						tool_call_id = getattr(event, "tool_call_id", "") or ""
+						if tool_call_id:
+							entry["id"] = tool_call_id
+
+						name = getattr(event, "name", "") or ""
+						if name:
+							entry["name"] = name
+
+						delta = getattr(event, "delta", "") or ""
+						if delta:
+							entry["arguments"] += delta
+
+						if (
+							CONFIG["stream_console_updates"]
+							and entry["name"]
+							and index not in streamed_tool_names_announced
+						):
+							console.print(f"\n[cyan]Tool planned:[/cyan] {entry['name']}")
+							streamed_tool_names_announced.add(index)
+
+				completion = stream.get_final_completion()
 		except Exception as exc:
 			status = f"Failed: {exc}"
+			if CONFIG["stream_console_updates"]:
+				console.print()
 			break
 
-		usage = response.usage
+		if CONFIG["stream_console_updates"]:
+			console.print()
+
+		usage = completion.usage
 		if usage:
 			total_in_tokens += int(usage.prompt_tokens or 0)
 			total_out_tokens += int(usage.completion_tokens or 0)
 
-		message = response.choices[0].message
-		assistant_text = message.content or ""
-		if assistant_text:
+		message = completion.choices[0].message
+		assistant_text = message.content or final_text
+		if not final_text:
 			final_text = assistant_text
-			console.print(Panel(assistant_text, title="Assistant", border_style="magenta"))
+
+		normalized_tool_calls: list[dict[str, str]] = []
+		if message.tool_calls:
+			for tc in message.tool_calls:
+				normalized_tool_calls.append(
+					{
+						"id": tc.id,
+						"name": tc.function.name,
+						"arguments": tc.function.arguments or "{}",
+					}
+				)
+		elif streamed_tool_calls:
+			for idx in sorted(streamed_tool_calls):
+				entry = streamed_tool_calls[idx]
+				normalized_tool_calls.append(
+					{
+						"id": entry.get("id", "") or f"streamed_tool_{idx}",
+						"name": entry.get("name", ""),
+						"arguments": entry.get("arguments", "") or "{}",
+					}
+				)
 
 		assistant_payload: dict[str, Any] = {
 			"role": "assistant",
 			"content": assistant_text,
 		}
 
-		if message.tool_calls:
+		if normalized_tool_calls:
 			assistant_payload["tool_calls"] = [
 				{
-					"id": tc.id,
-					"type": tc.type,
+					"id": tc["id"],
+					"type": "function",
 					"function": {
-						"name": tc.function.name,
-						"arguments": tc.function.arguments,
+						"name": tc["name"],
+						"arguments": tc["arguments"],
 					},
 				}
-				for tc in message.tool_calls
+				for tc in normalized_tool_calls
 			]
 
 		messages.append(assistant_payload)
 
-		if not message.tool_calls:
+		if not normalized_tool_calls:
 			break
 
 		stop_due_to_tool_limit = False
-		for tool_call in message.tool_calls:
+		for tool_call in normalized_tool_calls:
 			if CONFIG["max_tool_calls_per_iteration"] > 0 and total_tool_calls >= CONFIG["max_tool_calls_per_iteration"]:
 				status = (
 					f"Stopped early: tool call limit reached "
@@ -766,8 +858,8 @@ def run_iteration(
 				break
 
 			total_tool_calls += 1
-			fn_name = tool_call.function.name
-			raw_args = tool_call.function.arguments or "{}"
+			fn_name = tool_call["name"]
+			raw_args = tool_call["arguments"] or "{}"
 			try:
 				args = json.loads(raw_args)
 				if not isinstance(args, dict):
@@ -777,20 +869,17 @@ def run_iteration(
 
 			result = execute_function(fn_name, args, state, state_path, manuscript_path)
 			result_text = json.dumps(result, ensure_ascii=False)
+			args_preview = compact_json(args if args else raw_args, CONFIG["tool_args_max_chars"])
+			result_preview = compact_json(result, CONFIG["tool_result_max_chars"])
 
-			console.print(
-				Panel(
-					f"[bold]Tool:[/bold] {fn_name}\n[bold]Args:[/bold] {json.dumps(args, ensure_ascii=False)}\n"
-					f"[bold]Result:[/bold] {result_text}",
-					title="Tool Call",
-					border_style="cyan",
-				)
-			)
+			console.print(f"[cyan]Tool #{total_tool_calls}:[/cyan] {fn_name}")
+			console.print(f"  [bold]args[/bold]: {args_preview}")
+			console.print(f"  [bold]result[/bold]: {result_preview}")
 
 			messages.append(
 				{
 					"role": "tool",
-					"tool_call_id": tool_call.id,
+					"tool_call_id": tool_call["id"],
 					"name": fn_name,
 					"content": result_text,
 				}
