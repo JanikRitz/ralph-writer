@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from ralph_writer.manuscript import get_manuscript_info_data, parse_sections, read_manuscript, write_manuscript
+from ralph_writer.manuscript import get_manuscript_info_data, parse_sections, read_manuscript, write_manuscript, heal_manuscript
 from ralph_writer.utils import count_words, read_json, write_json
 
 
@@ -225,6 +225,8 @@ def execute_tool(
     ai_state = state.setdefault("ai_state", {})
 
     def available_sections() -> list[str]:
+        # Auto-heal manuscript before reading sections
+        heal_manuscript(manuscript_path)
         return [s["name"] for s in parse_sections(read_manuscript(manuscript_path))]
 
     try:
@@ -296,6 +298,8 @@ def execute_tool(
         if name == "create_section":
             section_name = arguments["name"].strip()
             content = arguments["content"].strip("\n")
+            # Heal manuscript before reading to ensure consistent state
+            heal_manuscript(manuscript_path)
             text = read_manuscript(manuscript_path)
             sections = parse_sections(text)
             if section_name in [s["name"] for s in sections]:
@@ -316,6 +320,8 @@ def execute_tool(
         if name == "replace_section":
             section_name = arguments["name"].strip()
             content = arguments["content"].strip("\n")
+            # Heal manuscript before reading to ensure consistent state
+            heal_manuscript(manuscript_path)
             text = read_manuscript(manuscript_path)
             sections = parse_sections(text)
             target = next((s for s in sections if s["name"] == section_name), None)
@@ -332,6 +338,8 @@ def execute_tool(
 
         if name == "delete_section":
             section_name = arguments["name"].strip()
+            # Heal manuscript before reading to ensure consistent state
+            heal_manuscript(manuscript_path)
             text = read_manuscript(manuscript_path)
             sections = parse_sections(text)
             target = next((s for s in sections if s["name"] == section_name), None)
