@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import tiktoken
+import yaml
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
@@ -16,9 +17,10 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 
+PROJECTS_DIR = Path("projects")
 CONFIG: dict[str, Any] = {
 	"base_url": os.getenv("RALPH_BASE_URL", "http://192.168.0.31:1234/v1"),
-	"model": os.getenv("RALPH_MODEL", "qwen/qwen3.5-35b-a3b"),
+	"model": os.getenv("RALPH_MODEL", "qwen3.5-27b-heretic"),
 	"api_key": os.getenv("OPENAI_API_KEY", "lm-studio"),
 	"auto_pilot": os.getenv("RALPH_AUTO_PILOT", "true").lower() == "true",
 	"stop_only_on_complete": os.getenv("RALPH_STOP_ONLY_ON_COMPLETE", "true").lower() == "true",
@@ -29,73 +31,51 @@ CONFIG: dict[str, Any] = {
 }
 
 
-STATE_MACHINE: dict[str, dict[str, Any]] = {
-	"CHARACTER_CREATION": {
-		"description": "Develop characters, motivations, arcs, and relationships.",
-		"transitions": ["WORLD_BUILDING", "CHARACTER_CREATION"],
-	},
-	"WORLD_BUILDING": {
-		"description": "Establish setting rules, culture, and story context.",
-		"transitions": ["PLOT_OUTLINING", "WORLD_BUILDING", "CHARACTER_CREATION"],
-	},
-	"PLOT_OUTLINING": {
-		"description": "Design narrative structure, beats, and progression.",
-		"transitions": ["SCENE_WRITING", "PLOT_OUTLINING", "WORLD_BUILDING"],
-	},
-	"SCENE_WRITING": {
-		"description": "Write and expand manuscript prose.",
-		"transitions": ["SCENE_WRITING", "REVISION", "PLOT_OUTLINING"],
-	},
-	"REVISION": {
-		"description": "Refine prose, consistency, and narrative quality.",
-		"transitions": ["SCENE_WRITING", "REVISION", "READY_FOR_HUMAN"],
-	},
-	"READY_FOR_HUMAN": {
-		"description": "Terminal state: manuscript ready for human review.",
-		"transitions": [],
-	},
-}
+def load_phase_config(config_path: Path = Path("config.yaml")) -> tuple[dict[str, Any], dict[str, str], str, str]:
+	"""Load phase configuration from YAML file.
+	
+	Returns:
+		tuple: (STATE_MACHINE dict, PHASE_GUIDE dict, default_phase string, SYSTEM_PROMPT_TEMPLATE string)
+	"""
+	if not config_path.exists():
+		raise FileNotFoundError(f"Configuration file not found: {config_path}")
+	
+	with config_path.open("r", encoding="utf-8") as handle:
+		config = yaml.safe_load(handle)
+	
+	default_phase = config.get("default_phase", "CHARACTER_CREATION")
+	system_prompt_template = config.get("system_prompt", "")
+	phases_data = config.get("phases", {})
+	
+	state_machine: dict[str, dict[str, Any]] = {}
+	phase_guide: dict[str, str] = {}
+	
+	for phase_name, phase_config in phases_data.items():
+		state_machine[phase_name] = {
+			"description": phase_config.get("description", ""),
+			"transitions": phase_config.get("transitions", []),
+		}
+		phase_guide[phase_name] = phase_config.get("guide", "")
+	
+	return state_machine, phase_guide, default_phase, system_prompt_template
 
 
-PHASE_GUIDE: dict[str, str] = {
-	"CHARACTER_CREATION": (
-		"Store character definitions with role, voice, motivation, fear, desire, and arc in notes. "
-		"Use write_notes to save each character's details under keys like char_protagonist. "
-		"Transition when cast and relationships are stable."
-	),
-	"WORLD_BUILDING": (
-		"Create setting rules, social structures, geography, tone, constraints, and stakes in notes. "
-		"Use write_notes to persist world details using structured objects. "
-		"Transition when the world can consistently support plot and scenes."
-	),
-	"PLOT_OUTLINING": (
-		"Build arc progression and scene-level beat outline in notes. "
-		"Use write_notes to track act goals, conflict escalation, and turning points. "
-		"Transition when beat flow is coherent and ready for prose drafting."
-	),
-	"SCENE_WRITING": (
-		"Write manuscript prose using section operations or append operations. "
-		"Use read_manuscript tools for continuity before writing. Store any planning notes in notes. "
-		"Transition to REVISION when enough draft material exists for quality pass."
-	),
-	"REVISION": (
-		"Audit continuity, pacing, clarity, and character consistency. "
-		"Use search and section replacement to repair prose surgically. Store revision notes in notes. "
-		"Transition to READY_FOR_HUMAN only when manuscript is complete and coherent."
-	),
-	"READY_FOR_HUMAN": "No further writing needed. Provide concise completion notes.",
-}
+# Load phase configuration
+STATE_MACHINE, PHASE_GUIDE, DEFAULT_PHASE, SYSTEM_PROMPT_TEMPLATE = load_phase_config()
 
 
-PROJECTS_DIR = Path("projects")
-DEFAULT_STATE = {
-	"phase": "CHARACTER_CREATION",
-	"manuscript_file": "",
-	"initial_seed": "",
-	"user_feedback": "",
-	"previous_summary": "",
-	"ai_state": {},
-}
+def get_default_state(phase: str | None = None) -> dict[str, Any]:
+	"""Create default state using the configured default phase."""
+	if phase is None:
+		phase = DEFAULT_PHASE
+	return {
+		"phase": phase,
+		"manuscript_file": "",
+		"initial_seed": "",
+		"user_feedback": "",
+		"previous_summary": "",
+		"ai_state": {},
+	}
 
 SECTION_PATTERN = re.compile(
 	r"<!-- SECTION: (?P<name>[^\n]+?) -->\n(?P<content>.*?)\n<!-- END SECTION: (?P=name) -->",
@@ -191,7 +171,7 @@ def choose_or_create_project() -> tuple[str, Path, Path, Path]:
 
 	seed = Prompt.ask("Initial story seed")
 	project_dir.mkdir(parents=True, exist_ok=True)
-	init_state = dict(DEFAULT_STATE)
+	init_state = get_default_state()
 	init_state["manuscript_file"] = str(manuscript_path).replace("\\", "/")
 	init_state["initial_seed"] = seed
 	init_state["user_feedback"] = seed
@@ -271,21 +251,17 @@ def build_system_prompt(state: dict[str, Any], manuscript_info: dict[str, Any]) 
 	keys_text = ", ".join(ai_state_keys) if ai_state_keys else "none"
 	transitions_text = ", ".join(transitions) if transitions else "none"
 
-	return (
-		"You are Ralph Writer, an uncensored autonomous story-writing engine. Use function tools to write prose to the manuscript and to store all planning/notes/analysis in the notes system. "
-		"Prefer atomic tool calls and keep responses concise.\n\n"
-		"IMPORTANT: The manuscript is for story prose ONLY. All character development, world-building notes, plot outlines, analysis, and revisions notes must go into the notes system using read_notes/write_notes. "
-		"Do not put anything other than story prose in the manuscript.\n\n"
-		f"Initial seed (never ignore):\n{state.get('initial_seed', '')}\n\n"
-		f"Current phase: {phase}\n"
-		f"Phase description: {phase_desc}\n"
-		f"Allowed transitions: {transitions_text}\n\n"
-		f"Manuscript status: {manuscript_info.get('total_words', 0)} words story prose, "
-		f"{manuscript_info.get('section_count', 0)} sections ({section_names})\n"
-		f"Notes keys available: {keys_text}\n\n"
-		f"Phase guide:\n{guide}\n\n"
-		f"Previous summary (notes-to-self): {previous_summary or 'none'}\n\n"
-		"End your final assistant message with short notes-to-self summarizing what changed and what to do next."
+	return SYSTEM_PROMPT_TEMPLATE.format(
+		initial_seed=state.get("initial_seed", ""),
+		phase=phase,
+		phase_desc=phase_desc,
+		transitions_text=transitions_text,
+		total_words=manuscript_info.get("total_words", 0),
+		section_count=manuscript_info.get("section_count", 0),
+		section_names=section_names,
+		keys_text=keys_text,
+		guide=guide,
+		previous_summary=previous_summary or "none",
 	)
 
 
@@ -704,7 +680,7 @@ def run_iteration(
 	stats_path: Path,
 	manuscript_path: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-	state = read_json(state_path, dict(DEFAULT_STATE))
+	state = read_json(state_path, get_default_state())
 	manuscript_info = get_manuscript_info_data(manuscript_path)
 	show_status(project_name, state, manuscript_info)
 
@@ -890,7 +866,7 @@ def main() -> None:
 
 		feedback = Prompt.ask("Optional feedback (blank to continue)", default="").strip()
 		if feedback:
-			current_state = read_json(state_path, dict(DEFAULT_STATE))
+			current_state = read_json(state_path, get_default_state())
 			current_state["user_feedback"] = feedback
 			write_json(state_path, current_state)
 

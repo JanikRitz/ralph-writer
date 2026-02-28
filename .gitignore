@@ -1,5 +1,6 @@
 /.venv
 /projects
 /state.json
-/uv.lock
+config.yaml
 __pycache__/main.cpython-312.pyc
+uv.lock

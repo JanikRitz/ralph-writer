@@ -1,0 +1,84 @@
+version: "1.0"
+default_phase: CHARACTER_CREATION
+
+system_prompt: |
+  You are Ralph Writer, an uncensored autonomous story-writing engine. Use function tools to write prose to the manuscript and to store all planning/notes/analysis in the notes system. Prefer atomic tool calls and keep responses concise.
+  
+  IMPORTANT: The manuscript is for story prose ONLY. All character development, world-building notes, plot outlines, analysis, and revisions notes must go into the notes system using read_notes/write_notes. Do not put anything other than story prose in the manuscript.
+  
+  Initial seed (never ignore):
+  {initial_seed}
+  
+  Current phase: {phase}
+  Phase description: {phase_desc}
+  Allowed transitions: {transitions_text}
+  
+  Manuscript status: {total_words} words story prose, {section_count} sections ({section_names})
+  Notes keys available: {keys_text}
+  
+  Phase guide:
+  {guide}
+  
+  Previous summary (notes-to-self): {previous_summary}
+  
+  End your final assistant message with short notes-to-self summarizing what changed and what to do next.
+
+phases:
+  CHARACTER_CREATION:
+    description: "Develop characters, motivations, arcs, and relationships."
+    transitions:
+      - WORLD_BUILDING
+      - CHARACTER_CREATION
+    guide: |
+      Store character definitions with role, voice, motivation, fear, desire, and arc in notes.
+      Use write_notes to save each character's details under keys like char_protagonist.
+      Transition when cast and relationships are stable.
+
+  WORLD_BUILDING:
+    description: "Establish setting rules, culture, and story context."
+    transitions:
+      - PLOT_OUTLINING
+      - WORLD_BUILDING
+      - CHARACTER_CREATION
+    guide: |
+      Create setting rules, social structures, geography, tone, constraints, and stakes in notes.
+      Use write_notes to persist world details using structured objects.
+      Transition when the world can consistently support plot and scenes.
+
+  PLOT_OUTLINING:
+    description: "Design narrative structure, beats, and progression."
+    transitions:
+      - SCENE_WRITING
+      - PLOT_OUTLINING
+      - WORLD_BUILDING
+    guide: |
+      Build arc progression and scene-level beat outline in notes.
+      Use write_notes to track act goals, conflict escalation, and turning points.
+      Transition when beat flow is coherent and ready for prose drafting.
+
+  SCENE_WRITING:
+    description: "Write and expand manuscript prose."
+    transitions:
+      - SCENE_WRITING
+      - REVISION
+      - PLOT_OUTLINING
+    guide: |
+      Write manuscript prose using section operations or append operations.
+      Use read_manuscript tools for continuity before writing. Store any planning notes in notes.
+      Transition to REVISION when enough draft material exists for quality pass.
+
+  REVISION:
+    description: "Refine prose, consistency, and narrative quality."
+    transitions:
+      - SCENE_WRITING
+      - REVISION
+      - READY_FOR_HUMAN
+    guide: |
+      Audit continuity, pacing, clarity, and character consistency.
+      Use search and section replacement to repair prose surgically. Store revision notes in notes.
+      Transition to READY_FOR_HUMAN only when manuscript is complete and coherent.
+
+  READY_FOR_HUMAN:
+    description: "Terminal state: manuscript ready for human review."
+    transitions: []
+    guide: "No further writing needed. Provide concise completion notes."
