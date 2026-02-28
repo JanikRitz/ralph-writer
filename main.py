@@ -1,28 +1,35 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-import shutil
 import yaml
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
-from PIL import Image
 
 from ralph_writer.config.models import LoadedPhaseConfig, RuntimeSettings
+from ralph_writer.images import (
+	build_vision_message_blocks,
+	extract_image_refs,
+	validate_image_paths,
+)
+from ralph_writer.manuscript import (
+	get_manuscript_info_data,
+	parse_sections,
+	read_manuscript,
+	write_manuscript,
+)
 from ralph_writer.utils import (
 	count_words,
 	estimate_tokens_messages,
 	estimate_tokens_text,
-	line_number_of_index,
 	read_json,
 	truncate_text,
 	write_json,
@@ -91,11 +98,6 @@ def get_default_state(phase: str | None = None) -> dict[str, Any]:
 		"image_paths": [],
 	}
 
-SECTION_PATTERN = re.compile(
-	r"<!-- SECTION: (?P<name>[^\n]+?) -->\n(?P<content>.*?)\n<!-- END SECTION: (?P=name) -->",
-	re.DOTALL,
-)
-
 console = Console()
 
 
@@ -107,174 +109,6 @@ def safe_project_name(name: str) -> str:
 	cleaned = re.sub(r"[^a-zA-Z0-9_\- ]+", "", name).strip()
 	cleaned = cleaned.replace(" ", "_")
 	return cleaned or "untitled_project"
-
-
-def parse_sections(text: str) -> list[dict[str, Any]]:
-	sections: list[dict[str, Any]] = []
-	for match in SECTION_PATTERN.finditer(text):
-		section_name = match.group("name").strip()
-		content = match.group("content").strip("\n")
-		start = match.start()
-		end = match.end()
-		sections.append(
-			{
-				"name": section_name,
-				"content": content,
-				"start": start,
-				"end": end,
-				"start_line": line_number_of_index(text, start),
-				"end_line": line_number_of_index(text, end),
-				"words": count_words(content),
-			}
-		)
-	return sections
-
-
-def read_manuscript(path: Path) -> str:
-	if not path.exists():
-		path.parent.mkdir(parents=True, exist_ok=True)
-		path.write_text("", encoding="utf-8")
-	return path.read_text(encoding="utf-8")
-
-
-def extract_image_refs(text: str) -> list[str]:
-	"""Extract image references from text.
-	
-	Supports formats:
-	- #path/to/image.png (simple paths)
-	- #"path with spaces/image.png" (quoted paths)
-	"""
-	images: list[str] = []
-	# Match quoted paths: #"..." 
-	for match in re.finditer(r'#"([^"]+)"', text):
-		path = match.group(1).strip()
-		if path:
-			images.append(path)
-	# Match unquoted paths: #path/to/file (no spaces)
-	for match in re.finditer(r'#([^\s"#]+)', text):
-		path = match.group(1).strip()
-		if path and not path.startswith('"'):
-			images.append(path)
-	return images
-
-
-def validate_image_paths(image_refs: list[str], base_dir: Path) -> tuple[list[str], list[str]]:
-    """Validate and copy image files into project directory.
-    
-    Copies images from current working directory or source location into base_dir.
-    Returns (valid_paths_in_project, error_messages).
-    """
-    valid_paths: list[str] = []
-    errors: list[str] = []
-    
-    for ref in image_refs:
-        # Source: look for image relative to current working directory
-        src_path = Path(ref)
-        if not src_path.is_absolute():
-            src_path = Path.cwd() / src_path
-        
-        if not src_path.exists():
-            errors.append(f"Image not found at source: {ref}")
-            continue
-        
-        if not src_path.is_file():
-            errors.append(f"Not a file: {ref}")
-            continue
-        
-        try:
-            # Verify it's a supported image format
-            if src_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
-                errors.append(f"Unsupported format: {ref}")
-                continue
-            
-            # Destination: preserve relative path structure in project directory
-            dest_path = base_dir / ref
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Copy file into project directory
-            shutil.copy2(src_path, dest_path)
-            valid_paths.append(ref)
-            
-            # Scale down image to reduce token usage for vision API
-            try:
-                img = Image.open(dest_path)
-                
-                # Scale down to max 1024px on longest side
-                max_size = 512
-                img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-                
-                # Save scaled image back, using quality 85 for jpg/webp
-                if dest_path.suffix.lower() in {".jpg", ".jpeg"}:
-                    img.save(dest_path, quality=85, optimize=True)
-                elif dest_path.suffix.lower() == ".webp":
-                    img.save(dest_path, quality=85)
-                else:
-                    img.save(dest_path, optimize=True)
-            
-            except ImportError:
-                errors.append(f"Pillow not installed; skipping image scaling for {ref}")
-                # Continue anyway—image is copied but not scaled
-            except Exception as e:
-                errors.append(f"Warning: Could not scale image {ref}: {e}")
-                # Continue anyway—image is copied but not scaled
-            
-        except Exception as e:
-            errors.append(f"Error copying {ref}: {e}")
-    
-    return valid_paths, errors
-
-
-def encode_image_to_base64(path: Path) -> str:
-	"""Read image file and encode to base64 data URL."""
-	with open(path, "rb") as img_file:
-		b64 = base64.b64encode(img_file.read()).decode("utf-8")
-	# Determine MIME type from extension
-	suffix = path.suffix.lower()
-	mime_map = {
-		".png": "image/png",
-		".jpg": "image/jpeg",
-		".jpeg": "image/jpeg",
-		".gif": "image/gif",
-		".webp": "image/webp",
-		".bmp": "image/bmp",
-	}
-	mime_type = mime_map.get(suffix, "image/png")
-	return f"data:{mime_type};base64,{b64}"
-
-
-def build_vision_message_blocks(text: str, image_refs: list[str], base_dir: Path) -> list[dict[str, Any]]:
-	"""Build message content blocks for vision API.
-	
-	Returns list of blocks: [{"type": "text", ...}, {"type": "image_url", ...}]
-	"""
-	content_blocks: list[dict[str, Any]] = []
-	
-	# Add text block
-	if text.strip():
-		content_blocks.append({
-			"type": "text",
-			"text": text,
-		})
-	
-	# Add image blocks
-	for ref in image_refs:
-		try:
-			img_path = base_dir / ref
-			if img_path.exists() and img_path.is_file():
-				img_url = encode_image_to_base64(img_path)
-				content_blocks.append({
-					"type": "image_url",
-					"image_url": {"url": img_url},
-				})
-		except Exception as e:
-			console.print(f"[yellow]Warning: Could not load image {ref}: {e}[/yellow]")
-	
-	return content_blocks
-
-
-def write_manuscript(path: Path, content: str) -> None:
-	path.parent.mkdir(parents=True, exist_ok=True)
-	path.write_text(content, encoding="utf-8")
 
 
 def choose_or_create_project() -> tuple[str, Path, Path, Path]:
@@ -360,25 +194,6 @@ def summarize_keys(ai_state: dict[str, Any]) -> dict[str, str]:
 		else:
 			result[key] = type(value).__name__
 	return result
-
-
-def get_manuscript_info_data(manuscript_path: Path) -> dict[str, Any]:
-	text = read_manuscript(manuscript_path)
-	sections = parse_sections(text)
-	lines = text.splitlines()
-	return {
-		"total_words": count_words(text),
-		"total_lines": len(lines),
-		"section_count": len(sections),
-		"sections": [
-			{
-				"name": s["name"],
-				"words": s["words"],
-				"line_range": [s["start_line"], s["end_line"]],
-			}
-			for s in sections
-		],
-	}
 
 
 def compact_json(value: Any, max_chars: int) -> str:
