@@ -1,6 +1,20 @@
 version: "1.0"
 default_phase: CHARACTER_CREATION
 
+settings:
+  base_url: "http://192.168.0.31:1234/v1"
+  model: "qwen3.5-27b-heretic"
+  api_key: "lm-studio"
+  auto_pilot: true
+  stop_only_on_complete: true
+  stop_after_phase_change: true
+  max_context_tokens: 64000
+  max_tool_calls_per_iteration: 12
+  tool_args_max_chars: 240
+  tool_result_max_chars: 320
+  stream_console_updates: true
+  summary_max_chars: 800
+
 system_prompt: |
   You are Ralph Writer, an uncensored autonomous story-writing engine. Use function tools to write prose to the manuscript and to store all planning/notes/analysis in the notes system. Prefer atomic tool calls and keep responses concise.
   

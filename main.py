@@ -21,27 +21,14 @@ from PIL import Image
 
 
 PROJECTS_DIR = Path("projects")
-CONFIG: dict[str, Any] = {
-	"base_url": os.getenv("RALPH_BASE_URL", "http://192.168.0.31:1234/v1"),
-	"model": os.getenv("RALPH_MODEL", "qwen3.5-27b-heretic"),
-	"api_key": os.getenv("OPENAI_API_KEY", "lm-studio"),
-	"auto_pilot": os.getenv("RALPH_AUTO_PILOT", "true").lower() == "true",
-	"stop_only_on_complete": os.getenv("RALPH_STOP_ONLY_ON_COMPLETE", "true").lower() == "true",
-	"stop_after_phase_change": os.getenv("RALPH_STOP_AFTER_PHASE_CHANGE", "true").lower() == "true",
-	"max_context_tokens": int(os.getenv("RALPH_MAX_CONTEXT_TOKENS", "64000")),
-	"max_tool_calls_per_iteration": int(os.getenv("RALPH_MAX_TOOL_CALLS_PER_ITERATION", "12")),
-	"tool_args_max_chars": int(os.getenv("RALPH_TOOL_ARGS_MAX_CHARS", "240")),
-	"tool_result_max_chars": int(os.getenv("RALPH_TOOL_RESULT_MAX_CHARS", "320")),
-	"stream_console_updates": os.getenv("RALPH_STREAM_CONSOLE_UPDATES", "true").lower() == "true",
-	"summary_max_chars": 800,
-}
+CONFIG: dict[str, Any] = {}  # Will be populated from config.yaml
 
 
-def load_phase_config(config_path: Path = Path("config.yaml")) -> tuple[dict[str, Any], dict[str, str], str, str]:
+def load_phase_config(config_path: Path = Path("config.yaml")) -> tuple[dict[str, Any], dict[str, str], str, str, dict[str, Any]]:
 	"""Load phase configuration from YAML file.
 	
 	Returns:
-		tuple: (STATE_MACHINE dict, PHASE_GUIDE dict, default_phase string, SYSTEM_PROMPT_TEMPLATE string)
+		tuple: (STATE_MACHINE dict, PHASE_GUIDE dict, default_phase string, SYSTEM_PROMPT_TEMPLATE string, settings dict)
 	"""
 	if not config_path.exists():
 		raise FileNotFoundError(f"Configuration file not found: {config_path}")
@@ -52,6 +39,7 @@ def load_phase_config(config_path: Path = Path("config.yaml")) -> tuple[dict[str
 	default_phase = config.get("default_phase", "CHARACTER_CREATION")
 	system_prompt_template = config.get("system_prompt", "")
 	phases_data = config.get("phases", {})
+	settings = config.get("settings", {})
 	
 	state_machine: dict[str, dict[str, Any]] = {}
 	phase_guide: dict[str, str] = {}
@@ -63,11 +51,25 @@ def load_phase_config(config_path: Path = Path("config.yaml")) -> tuple[dict[str
 		}
 		phase_guide[phase_name] = phase_config.get("guide", "")
 	
-	return state_machine, phase_guide, default_phase, system_prompt_template
+	return state_machine, phase_guide, default_phase, system_prompt_template, settings
 
 
 # Load phase configuration
-STATE_MACHINE, PHASE_GUIDE, DEFAULT_PHASE, SYSTEM_PROMPT_TEMPLATE = load_phase_config()
+STATE_MACHINE, PHASE_GUIDE, DEFAULT_PHASE, SYSTEM_PROMPT_TEMPLATE, _SETTINGS = load_phase_config()
+
+# Apply settings: config.yaml -> ENV variable -> default value
+CONFIG["base_url"] = _SETTINGS.get("base_url", os.getenv("RALPH_BASE_URL", "http://localhost:1234/v1"))
+CONFIG["model"] = _SETTINGS.get("model", os.getenv("RALPH_MODEL", "qwen/qwen3.5-35b-a3b"))
+CONFIG["api_key"] = _SETTINGS.get("api_key", os.getenv("OPENAI_API_KEY", "lm-studio"))
+CONFIG["auto_pilot"] = _SETTINGS.get("auto_pilot", os.getenv("RALPH_AUTO_PILOT", "true").lower() == "true")
+CONFIG["stop_only_on_complete"] = _SETTINGS.get("stop_only_on_complete", os.getenv("RALPH_STOP_ONLY_ON_COMPLETE", "true").lower() == "true")
+CONFIG["stop_after_phase_change"] = _SETTINGS.get("stop_after_phase_change", os.getenv("RALPH_STOP_AFTER_PHASE_CHANGE", "true").lower() == "true")
+CONFIG["max_context_tokens"] = _SETTINGS.get("max_context_tokens", int(os.getenv("RALPH_MAX_CONTEXT_TOKENS", "64000")))
+CONFIG["max_tool_calls_per_iteration"] = _SETTINGS.get("max_tool_calls_per_iteration", int(os.getenv("RALPH_MAX_TOOL_CALLS_PER_ITERATION", "12")))
+CONFIG["tool_args_max_chars"] = _SETTINGS.get("tool_args_max_chars", int(os.getenv("RALPH_TOOL_ARGS_MAX_CHARS", "240")))
+CONFIG["tool_result_max_chars"] = _SETTINGS.get("tool_result_max_chars", int(os.getenv("RALPH_TOOL_RESULT_MAX_CHARS", "320")))
+CONFIG["stream_console_updates"] = _SETTINGS.get("stream_console_updates", os.getenv("RALPH_STREAM_CONSOLE_UPDATES", "true").lower() == "true")
+CONFIG["summary_max_chars"] = _SETTINGS.get("summary_max_chars", int(os.getenv("RALPH_SUMMARY_MAX_CHARS", "800")))
 
 
 def get_default_state(phase: str | None = None) -> dict[str, Any]:
