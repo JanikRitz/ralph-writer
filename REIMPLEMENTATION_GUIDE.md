@@ -62,7 +62,8 @@ CONFIG = {
     "base_url": "http://192.168.0.31:1234/v1",  # LM Studio endpoint
     "model": "qwen/qwen3.5-35b-a3b",           # Model identifier
     "auto_pilot": True,                         # Continuous operation mode
-    "stop_only_on_complete": True               # Only stop at READY_FOR_HUMAN
+    "stop_only_on_complete": True,              # Only stop at READY_FOR_HUMAN
+    "stop_after_phase_change": True             # End iteration after successful phase switch
 }
 ```
 
@@ -71,6 +72,7 @@ CONFIG = {
 - Model string is passed to API but not validated
 - Auto-pilot controls whether loop pauses for user input
 - Stop-only-on-complete prevents premature termination
+- Stop-after-phase-change prevents one iteration from spanning multiple phase loops
 
 ### 2. State Machine
 
@@ -413,6 +415,7 @@ Content goes here...
 ### 1. Autonomous Operation
 - **Auto-pilot mode**: Continuous operation without user intervention
 - **Stop-only-on-complete**: Prevents premature stopping
+- **Stop-after-phase-change**: Starts a new iteration with fresh context when phase changes
 - **Memory continuity**: Previous iteration summary maintains context
 - **Creative anchor**: Initial seed included in every loop to maintain original vision
 

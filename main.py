@@ -24,9 +24,9 @@ CONFIG: dict[str, Any] = {
 	"api_key": os.getenv("OPENAI_API_KEY", "lm-studio"),
 	"auto_pilot": os.getenv("RALPH_AUTO_PILOT", "true").lower() == "true",
 	"stop_only_on_complete": os.getenv("RALPH_STOP_ONLY_ON_COMPLETE", "true").lower() == "true",
-	"max_tool_turns": int(os.getenv("RALPH_MAX_TOOL_TURNS", "10")),
+	"stop_after_phase_change": os.getenv("RALPH_STOP_AFTER_PHASE_CHANGE", "true").lower() == "true",
 	"max_context_tokens": int(os.getenv("RALPH_MAX_CONTEXT_TOKENS", "16000")),
-	"max_tool_calls_per_iteration": int(os.getenv("RALPH_MAX_TOOL_CALLS_PER_ITERATION", "0")),
+	"max_tool_calls_per_iteration": int(os.getenv("RALPH_MAX_TOOL_CALLS_PER_ITERATION", "12")),
 	"tool_args_max_chars": int(os.getenv("RALPH_TOOL_ARGS_MAX_CHARS", "240")),
 	"tool_result_max_chars": int(os.getenv("RALPH_TOOL_RESULT_MAX_CHARS", "320")),
 	"stream_console_updates": os.getenv("RALPH_STREAM_CONSOLE_UPDATES", "true").lower() == "true",
@@ -648,9 +648,17 @@ def show_stats_table(stats: dict[str, Any]) -> None:
 
 	start_num = len(loops) - len(recent) + 1
 	for i, row in enumerate(recent):
+		phase_list = row.get("phases", [])
+		if isinstance(phase_list, list):
+			phase_display = " -> ".join(str(phase) for phase in phase_list if str(phase).strip())
+		else:
+			phase_display = ""
+		if not phase_display:
+			phase_display = str(row.get("phase", ""))
+
 		table.add_row(
 			str(start_num + i),
-			str(row.get("phase", "")),
+			phase_display,
 			str(row.get("status", "")),
 			str(row.get("in_tokens", 0)),
 			str(row.get("out_tokens", 0)),
@@ -708,6 +716,7 @@ def run_iteration(
 	total_in_tokens = 0
 	total_out_tokens = 0
 	total_tool_calls = 0
+	phases_with_tool_calls: list[str] = []
 	final_text = ""
 	status = "Success"
 
@@ -718,7 +727,7 @@ def run_iteration(
 		{"role": "user", "content": user_message},
 	]
 
-	for _ in range(CONFIG["max_tool_turns"]):
+	while True:
 		if CONFIG["max_context_tokens"] > 0:
 			current_context_tokens = estimate_tokens_messages(CONFIG["model"], messages)
 			if current_context_tokens >= CONFIG["max_context_tokens"]:
@@ -847,6 +856,7 @@ def run_iteration(
 			break
 
 		stop_due_to_tool_limit = False
+		stop_due_to_phase_change = False
 		for tool_call in normalized_tool_calls:
 			if CONFIG["max_tool_calls_per_iteration"] > 0 and total_tool_calls >= CONFIG["max_tool_calls_per_iteration"]:
 				status = (
@@ -867,7 +877,11 @@ def run_iteration(
 			except Exception:
 				args = {}
 
+			phase_before_call = state.get("phase", "CHARACTER_CREATION")
+			if not phases_with_tool_calls or phases_with_tool_calls[-1] != phase_before_call:
+				phases_with_tool_calls.append(phase_before_call)
 			result = execute_function(fn_name, args, state, state_path, manuscript_path)
+			phase_after_call = state.get("phase", "CHARACTER_CREATION")
 			result_text = json.dumps(result, ensure_ascii=False)
 			args_preview = compact_json(args if args else raw_args, CONFIG["tool_args_max_chars"])
 			result_preview = compact_json(result, CONFIG["tool_result_max_chars"])
@@ -885,7 +899,22 @@ def run_iteration(
 				}
 			)
 
+			if (
+				CONFIG["stop_after_phase_change"]
+				and fn_name == "change_phase"
+				and phase_after_call != phase_before_call
+			):
+				status = (
+					f"Stopped after phase change: {phase_before_call} -> {phase_after_call} "
+					"(next iteration starts with fresh context)"
+				)
+				console.print(f"[yellow]{status}[/yellow]")
+				stop_due_to_phase_change = True
+				break
+
 		if stop_due_to_tool_limit:
+			break
+		if stop_due_to_phase_change:
 			break
 
 	if total_in_tokens == 0 and total_out_tokens == 0:
@@ -899,6 +928,7 @@ def run_iteration(
 	loop_row = {
 		"timestamp": now_iso(),
 		"phase": state.get("phase", "UNKNOWN"),
+		"phases": phases_with_tool_calls,
 		"status": status,
 		"in_tokens": total_in_tokens,
 		"out_tokens": total_out_tokens,
@@ -928,7 +958,8 @@ def main() -> None:
 	console.print(
 		Panel(
 			f"Model: {CONFIG['model']}\nBase URL: {CONFIG['base_url']}\n"
-			f"Auto-pilot: {CONFIG['auto_pilot']}",
+			f"Auto-pilot: {CONFIG['auto_pilot']}\n"
+			f"Stop after phase change: {CONFIG['stop_after_phase_change']}",
 			title="Session Config",
 			border_style="green",
 		)
