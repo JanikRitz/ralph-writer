@@ -3,14 +3,12 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 import shutil
-import tiktoken
 import yaml
 from openai import OpenAI
 from rich.console import Console
@@ -19,16 +17,24 @@ from rich.prompt import Prompt
 from rich.table import Table
 from PIL import Image
 
+from ralph_writer.config.models import LoadedPhaseConfig, RuntimeSettings
+from ralph_writer.utils import (
+	count_words,
+	estimate_tokens_messages,
+	estimate_tokens_text,
+	line_number_of_index,
+	read_json,
+	truncate_text,
+	write_json,
+)
+
 
 PROJECTS_DIR = Path("projects")
 CONFIG: dict[str, Any] = {}  # Will be populated from config.yaml
 
 
-def load_phase_config(config_path: Path = Path("config.yaml")) -> tuple[dict[str, Any], dict[str, str], str, str, dict[str, Any]]:
+def load_phase_config(config_path: Path = Path("config.yaml")) -> LoadedPhaseConfig:
 	"""Load phase configuration from YAML file.
-	
-	Returns:
-		tuple: (STATE_MACHINE dict, PHASE_GUIDE dict, default_phase string, SYSTEM_PROMPT_TEMPLATE string, settings dict)
 	"""
 	if not config_path.exists():
 		raise FileNotFoundError(f"Configuration file not found: {config_path}")
@@ -50,26 +56,25 @@ def load_phase_config(config_path: Path = Path("config.yaml")) -> tuple[dict[str
 			"transitions": phase_config.get("transitions", []),
 		}
 		phase_guide[phase_name] = phase_config.get("guide", "")
-	
-	return state_machine, phase_guide, default_phase, system_prompt_template, settings
+
+	return LoadedPhaseConfig(
+		state_machine=state_machine,
+		phase_guide=phase_guide,
+		default_phase=default_phase,
+		system_prompt_template=system_prompt_template,
+		settings=settings,
+	)
 
 
 # Load phase configuration
-STATE_MACHINE, PHASE_GUIDE, DEFAULT_PHASE, SYSTEM_PROMPT_TEMPLATE, _SETTINGS = load_phase_config()
+_PHASE_CONFIG = load_phase_config()
+STATE_MACHINE = _PHASE_CONFIG.state_machine
+PHASE_GUIDE = _PHASE_CONFIG.phase_guide
+DEFAULT_PHASE = _PHASE_CONFIG.default_phase
+SYSTEM_PROMPT_TEMPLATE = _PHASE_CONFIG.system_prompt_template
 
 # Apply settings: config.yaml -> ENV variable -> default value
-CONFIG["base_url"] = _SETTINGS.get("base_url", os.getenv("RALPH_BASE_URL", "http://localhost:1234/v1"))
-CONFIG["model"] = _SETTINGS.get("model", os.getenv("RALPH_MODEL", "qwen/qwen3.5-35b-a3b"))
-CONFIG["api_key"] = _SETTINGS.get("api_key", os.getenv("OPENAI_API_KEY", "lm-studio"))
-CONFIG["auto_pilot"] = _SETTINGS.get("auto_pilot", os.getenv("RALPH_AUTO_PILOT", "true").lower() == "true")
-CONFIG["stop_only_on_complete"] = _SETTINGS.get("stop_only_on_complete", os.getenv("RALPH_STOP_ONLY_ON_COMPLETE", "true").lower() == "true")
-CONFIG["stop_after_phase_change"] = _SETTINGS.get("stop_after_phase_change", os.getenv("RALPH_STOP_AFTER_PHASE_CHANGE", "true").lower() == "true")
-CONFIG["max_context_tokens"] = _SETTINGS.get("max_context_tokens", int(os.getenv("RALPH_MAX_CONTEXT_TOKENS", "64000")))
-CONFIG["max_tool_calls_per_iteration"] = _SETTINGS.get("max_tool_calls_per_iteration", int(os.getenv("RALPH_MAX_TOOL_CALLS_PER_ITERATION", "12")))
-CONFIG["tool_args_max_chars"] = _SETTINGS.get("tool_args_max_chars", int(os.getenv("RALPH_TOOL_ARGS_MAX_CHARS", "240")))
-CONFIG["tool_result_max_chars"] = _SETTINGS.get("tool_result_max_chars", int(os.getenv("RALPH_TOOL_RESULT_MAX_CHARS", "320")))
-CONFIG["stream_console_updates"] = _SETTINGS.get("stream_console_updates", os.getenv("RALPH_STREAM_CONSOLE_UPDATES", "true").lower() == "true")
-CONFIG["summary_max_chars"] = _SETTINGS.get("summary_max_chars", int(os.getenv("RALPH_SUMMARY_MAX_CHARS", "800")))
+CONFIG.update(RuntimeSettings.from_sources(_PHASE_CONFIG.settings).to_dict())
 
 
 def get_default_state(phase: str | None = None) -> dict[str, Any]:
@@ -102,27 +107,6 @@ def safe_project_name(name: str) -> str:
 	cleaned = re.sub(r"[^a-zA-Z0-9_\- ]+", "", name).strip()
 	cleaned = cleaned.replace(" ", "_")
 	return cleaned or "untitled_project"
-
-
-def read_json(path: Path, default: Any) -> Any:
-	if not path.exists():
-		return default
-	with path.open("r", encoding="utf-8") as handle:
-		return json.load(handle)
-
-
-def write_json(path: Path, data: Any) -> None:
-	path.parent.mkdir(parents=True, exist_ok=True)
-	with path.open("w", encoding="utf-8") as handle:
-		json.dump(data, handle, ensure_ascii=False, indent=2)
-
-
-def count_words(text: str) -> int:
-	return len(re.findall(r"\S+", text))
-
-
-def line_number_of_index(text: str, index: int) -> int:
-	return text[:index].count("\n") + 1
 
 
 def parse_sections(text: str) -> list[dict[str, Any]]:
@@ -395,28 +379,6 @@ def get_manuscript_info_data(manuscript_path: Path) -> dict[str, Any]:
 			for s in sections
 		],
 	}
-
-
-def estimate_tokens_text(model: str, text: str) -> int:
-	try:
-		encoding = tiktoken.encoding_for_model(model)
-	except Exception:
-		encoding = tiktoken.get_encoding("cl100k_base")
-	return len(encoding.encode(text))
-
-
-def estimate_tokens_messages(model: str, messages: list[dict[str, Any]]) -> int:
-	flattened = "\n".join(json.dumps(m, ensure_ascii=False, default=str) for m in messages)
-	return estimate_tokens_text(model, flattened)
-
-
-def truncate_text(text: str, max_chars: int) -> str:
-	if max_chars <= 0:
-		return text
-	if len(text) <= max_chars:
-		return text
-	remaining = len(text) - max_chars
-	return f"{text[:max_chars]}… (+{remaining} chars)"
 
 
 def compact_json(value: Any, max_chars: int) -> str:
