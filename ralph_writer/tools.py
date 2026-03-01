@@ -350,6 +350,8 @@ def execute_tool(
             return f"deleted section '{section_name}'"
 
         if name == "change_phase":
+            from datetime import datetime
+            
             new_phase = arguments["new_phase"].strip()
             reason = arguments["reason"].strip()
             current_phase = state.get("phase", "CHARACTER_CREATION")
@@ -363,6 +365,27 @@ def execute_tool(
                     "error": f"invalid transition from {current_phase} to {new_phase}",
                     "available": allowed,
                 }
+
+            # Initialize phase_history if not present
+            if "phase_history" not in state:
+                state["phase_history"] = []
+            
+            phase_history = state["phase_history"]
+            now = datetime.now().isoformat(timespec="seconds")
+            
+            # Close out current phase entry if it exists
+            if phase_history and not phase_history[-1].get("exited_at"):
+                phase_history[-1]["exited_at"] = now
+                phase_history[-1]["exit_reason"] = reason
+            
+            # Start new phase entry
+            phase_history.append({
+                "phase": new_phase,
+                "entered_at": now,
+                "exited_at": None,
+                "exit_reason": None,
+                "loops": 0,
+            })
 
             state["phase"] = new_phase
             write_json(state_path, state)

@@ -24,6 +24,7 @@ class ProjectState:
             "previous_summary": "",
             "ai_state": {},
             "image_paths": [],
+            "phase_history": [],
         }
         self._data = read_json(self.path, default)
 
@@ -90,6 +91,12 @@ class ProjectState:
     def image_paths(self, value: list[str]) -> None:
         self._data["image_paths"] = value
         self.save()
+
+    @property
+    def phase_history(self) -> list[dict[str, Any]]:
+        if "phase_history" not in self._data:
+            self._data["phase_history"] = []
+        return self._data["phase_history"]
 
     def to_dict(self) -> dict[str, Any]:
         """Return state as dictionary."""

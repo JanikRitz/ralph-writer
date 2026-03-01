@@ -468,6 +468,13 @@ def main() -> None:
 		console.print(f"[bold]Phase:[/bold] {state.get('phase', '-')}")
 		console.print(f"[bold]Words:[/bold] {manuscript_info.get('total_words', 0)}")
 		console.print(f"[bold]Sections:[/bold] {manuscript_info.get('section_count', 0)}")
+		
+		# Show phase history if available
+		phase_history = state.get("phase_history", [])
+		if phase_history:
+			from ralph_writer.orchestrator import show_phase_history
+			show_phase_history(phase_history, max_entries=0)
+		
 		stats = project.get_stats()
 		show_stats_table(stats, max_entries=0)
 		return

@@ -11,3 +11,4 @@ class IterationResult:
 	loop_row: dict[str, Any]
 	status: str
 	total_tokens: int
+	phase_changed: bool

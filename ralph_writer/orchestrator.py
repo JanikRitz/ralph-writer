@@ -11,7 +11,6 @@ from typing import Any
 from openai import OpenAI
 from rich.console import Console
 
-from ralph_writer.config.models import RuntimeSettings
 from ralph_writer.core import IterationResult, Project
 from ralph_writer.images import build_vision_message_blocks
 from ralph_writer.manuscript import get_manuscript_info_data
@@ -29,6 +28,78 @@ console = Console()
 def now_iso() -> str:
 	"""Return current time as ISO string."""
 	return datetime.now().isoformat(timespec="seconds")
+
+
+def show_phase_history(phase_history: list[dict[str, Any]], max_entries: int = 10) -> None:
+	"""Display phase history table."""
+	from rich.table import Table
+
+	if not phase_history:
+		console.print("[dim]No phase history recorded yet.[/dim]")
+		return
+
+	recent = phase_history[-max_entries:] if max_entries > 0 else phase_history
+
+	table = Table(title="Phase History", show_lines=False)
+	table.add_column("#", justify="right")
+	table.add_column("Phase")
+	table.add_column("Entered")
+	table.add_column("Duration")
+	table.add_column("Loops", justify="right")
+	table.add_column("Exit Reason")
+
+	start_num = len(phase_history) - len(recent) + 1
+	for i, entry in enumerate(recent):
+		phase = entry.get("phase", "-")
+		entered_at = entry.get("entered_at", "-")
+		exited_at = entry.get("exited_at")
+		loops = entry.get("loops", 0)
+		exit_reason = entry.get("exit_reason", "-")
+
+		# Calculate duration
+		if entered_at != "-":
+			try:
+				enter_dt = datetime.fromisoformat(entered_at)
+				if exited_at:
+					exit_dt = datetime.fromisoformat(exited_at)
+					delta = exit_dt - enter_dt
+					minutes = int(delta.total_seconds() / 60)
+					if minutes > 0:
+						duration = f"{minutes}m"
+					else:
+						duration = f"{int(delta.total_seconds())}s"
+				else:
+					duration = "[yellow]active[/yellow]"
+					exit_reason = "-"
+			except Exception:
+				duration = "-"
+		else:
+			duration = "-"
+
+		# Format entered time (show just date and time)
+		if entered_at != "-":
+			try:
+				dt = datetime.fromisoformat(entered_at)
+				entered_display = dt.strftime("%m-%d %H:%M")
+			except Exception:
+				entered_display = entered_at
+		else:
+			entered_display = entered_at
+
+		# Truncate exit reason if too long
+		if exit_reason and len(exit_reason) > 50:
+			exit_reason = exit_reason[:47] + "..."
+
+		table.add_row(
+			str(start_num + i),
+			phase,
+			entered_display,
+			duration,
+			str(loops),
+			exit_reason or "-",
+		)
+
+	console.print(table)
 
 
 def compact_json(value: Any, max_chars: int) -> str:
@@ -118,13 +189,27 @@ def show_stats_table(stats: dict[str, Any], max_entries: int = 5) -> None:
 
 	start_num = len(loops) - len(recent) + 1
 	for i, row in enumerate(recent):
-		phase_list = row.get("phases", [])
-		if isinstance(phase_list, list):
-			phase_display = " -> ".join(str(phase) for phase in phase_list if str(phase).strip())
+		# Support both old and new format
+		start_phase = row.get("start_phase")
+		end_phase = row.get("end_phase")
+		phase_transitions = row.get("phase_transitions", [])
+		
+		if start_phase and end_phase:
+			# New format: show start -> end
+			if start_phase == end_phase:
+				phase_display = start_phase
+			else:
+				phase_display = f"{start_phase} → {end_phase}"
+				# Add transition count if there were intermediate phases
+				if len(phase_transitions) > 1:
+					phase_display += f" ({len(phase_transitions)} steps)"
 		else:
-			phase_display = ""
-		if not phase_display:
-			phase_display = str(row.get("phase", ""))
+			# Old format fallback: try phases list, then single phase
+			phase_list = row.get("phases", [])
+			if isinstance(phase_list, list) and phase_list:
+				phase_display = " → ".join(str(phase) for phase in phase_list if str(phase).strip())
+			else:
+				phase_display = str(row.get("phase", ""))
 
 		table.add_row(
 			str(start_num + i),
@@ -212,12 +297,19 @@ class SessionOrchestrator:
 		state = self.project.state.to_dict()
 		manuscript_info = get_manuscript_info_data(self.project.manuscript_path)
 		show_status(self.project.name, state, manuscript_info, self.state_machine)
+		
+		# Show recent phase history for context
+		phase_history = state.get("phase_history", [])
+		if phase_history:
+			show_phase_history(phase_history, max_entries=5)
 
 		start_time = time.time()
 		total_in_tokens = 0
 		total_out_tokens = 0
 		total_tool_calls = 0
-		phases_with_tool_calls: list[str] = []
+		initial_phase = state.get("phase", "CHARACTER_CREATION")
+		phase_transitions: list[str] = []
+		phase_changed = False
 		final_text = ""
 		status = "Success"
 
@@ -371,7 +463,6 @@ class SessionOrchestrator:
 				break
 
 			stop_due_to_tool_limit = False
-			stop_due_to_phase_change = False
 			for tool_call in normalized_tool_calls:
 				if self.config["max_tool_calls_per_iteration"] > 0 and total_tool_calls >= self.config["max_tool_calls_per_iteration"]:
 					status = (
@@ -393,10 +484,15 @@ class SessionOrchestrator:
 					args = {}
 
 				phase_before_call = state.get("phase", "CHARACTER_CREATION")
-				if not phases_with_tool_calls or phases_with_tool_calls[-1] != phase_before_call:
-					phases_with_tool_calls.append(phase_before_call)
+				if not phase_transitions or phase_transitions[-1] != phase_before_call:
+					phase_transitions.append(phase_before_call)
 				result = execute_tool(fn_name, args, state, self.project.state_path, self.project.manuscript_path, self.state_machine)
 				phase_after_call = state.get("phase", "CHARACTER_CREATION")
+
+				# Detect phase change from any tool call in the batch
+				if phase_after_call != phase_before_call:
+					phase_changed = True
+
 				result_text = json.dumps(result, ensure_ascii=False)
 				args_preview = compact_json(args if args else raw_args, self.config["tool_args_max_chars"])
 				result_preview = compact_json(result, self.config["tool_result_max_chars"])
@@ -414,34 +510,47 @@ class SessionOrchestrator:
 					}
 				)
 
-				if (
-					self.config["stop_after_phase_change"]
-					and fn_name == "change_phase"
-					and phase_after_call != phase_before_call
-				):
-					status = (
-						f"Stopped after phase change: {phase_before_call} -> {phase_after_call}"
-					)
-					console.print(f"[yellow]{status}[/yellow]")
-					stop_due_to_phase_change = True
-					break
-
+			# Stop iteration on tool limit or phase change
 			if stop_due_to_tool_limit:
 				break
-			if stop_due_to_phase_change:
+
+			if phase_changed and self.config["stop_after_phase_change"]:
+				console.print(
+					f"[yellow]Phase changed → {state.get('phase')}. "
+					f"Ending iteration to start fresh with new phase context.[/yellow]"
+				)
 				break
 
-		if total_in_tokens == 0 and total_out_tokens == 0:
-			total_in_tokens = estimate_tokens_messages(self.config["model"], messages)
-			total_out_tokens = estimate_tokens_text(self.config["model"], final_text)
-
-		self.project.state.previous_summary = final_text[: self.config["summary_max_chars"]]
+		# Reload state from disk so ProjectState reflects changes made by execute_tool
+		# (execute_tool writes directly to state.json, bypassing ProjectState._data)
+		self.project.state.load()
 		self.project.state.user_feedback = ""
 
+		final_phase = state.get("phase", "UNKNOWN")
+		
+		# Update phase history with loop count
+		phase_history = state.get("phase_history", [])
+		if not phase_history:
+			# Initialize with current phase if empty
+			phase_history = [{
+				"phase": final_phase,
+				"entered_at": now_iso(),
+				"exited_at": None,
+				"exit_reason": None,
+				"loops": 1,
+			}]
+			state["phase_history"] = phase_history
+			self.project.state.update({"phase_history": phase_history})
+		elif phase_history[-1].get("phase") == final_phase:
+			# Increment loop count for current phase
+			phase_history[-1]["loops"] = phase_history[-1].get("loops", 0) + 1
+			self.project.state.update({"phase_history": phase_history})
+		
 		loop_row = {
 			"timestamp": now_iso(),
-			"phase": state.get("phase", "UNKNOWN"),
-			"phases": phases_with_tool_calls,
+			"start_phase": initial_phase,
+			"end_phase": final_phase,
+			"phase_transitions": phase_transitions,
 			"status": status,
 			"in_tokens": total_in_tokens,
 			"out_tokens": total_out_tokens,
@@ -459,6 +568,7 @@ class SessionOrchestrator:
 			loop_row=loop_row,
 			status=status,
 			total_tokens=total_in_tokens + total_out_tokens,
+			phase_changed=phase_changed,
 		)
 
 	def run_session(self) -> None:
@@ -491,10 +601,21 @@ class SessionOrchestrator:
 				console.print("[bold green]Reached READY_FOR_HUMAN. Session complete.[/bold green]")
 				break
 
-			if self.config["auto_pilot"]:
-				time.sleep(2)
+			# Check if phase changed and stop_after_phase_change is enabled
+			if self.config["stop_after_phase_change"] and result.phase_changed:
+				if not self.config["auto_pilot"]:
+					feedback = Prompt.ask(
+						"Optional feedback before continuing with new phase",
+						default=""
+					).strip()
+					if feedback:
+						self.project.state.user_feedback = feedback
+				# Continue to next iteration with new phase context
+				time.sleep(1)
 				continue
+			time.sleep(2)
+			continue
 
-			feedback = Prompt.ask("Optional feedback (blank to continue)", default="").strip()
-			if feedback:
-				self.project.state.user_feedback = feedback
+		feedback = Prompt.ask("Optional feedback (blank to continue)", default="").strip()
+		if feedback:
+			self.project.state.user_feedback = feedback
