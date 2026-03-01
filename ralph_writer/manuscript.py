@@ -6,19 +6,22 @@ from typing import Any
 
 from ralph_writer.utils import count_words, line_number_of_index
 
-# Standard section marker pattern
+# Standard section marker pattern (matches normalized format with SECTION name)
 SECTION_PATTERN = re.compile(
     r"<!-- SECTION: (?P<name>[^\n]+?) -->\n(?P<content>.*?)\n<!-- END SECTION: (?P=name) -->",
     re.DOTALL,
 )
 
 # Patterns for detecting malformed/alternative markers to normalize
+# Matches: <!-- SECTION: name -->, <!-- START SECTION: name -->, <!-- CHAPTER: name -->, <!-- START CHAPTER: name -->, etc.
 MALFORMED_START_PATTERN = re.compile(
-    r"<!--\s*(?:SECTION|START\s+SECTION):\s*([^\n]+?)\s*-->",
+    r"<!--\s*(?:SECTION|START\s+(?:SECTION|CHAPTER)|CHAPTER):\s*([^\n]+?)\s*-->",
     re.IGNORECASE,
 )
+# Matches END markers: <!-- END SECTION: name -->, <!-- END CHAPTER: name -->, etc.
+# REQUIRES "END" to be present (not optional) to avoid matching opening markers
 MALFORMED_END_PATTERN = re.compile(
-    r"<!--\s*(?:END\s+)?SECTION:\s*([^\n]+?)\s*-->",
+    r"<!--\s*END\s+(?:SECTION|CHAPTER):\s*([^\n]+?)\s*-->",
     re.IGNORECASE,
 )
 
@@ -28,65 +31,77 @@ def normalize_section_markers(text: str) -> tuple[str, dict[str, int]]:
     Normalize and self-heal malformed section markers.
     
     Fixes:
-    - Alternative formats (START SECTION vs SECTION)
-    - Duplicate END markers
+    - Alternative formats (START SECTION vs SECTION, CHAPTER vs SECTION)
+    - Orphaned END markers (reconstructs missing START markers before them)
+    - Duplicate markers
     - Inconsistent spacing around markers
     
     Returns:
         Tuple of (cleaned_text, healing_stats) where healing_stats tracks what was fixed.
     """
-    stats = {"duplicates_removed": 0, "formats_normalized": 0}
+    stats = {"duplicates_removed": 0, "formats_normalized": 0, "orphaned_markers_fixed": 0}
     
-    # Find all section names that appear
-    all_sections: dict[str, dict[str, list[int]]] = {}
-    
-    for match in MALFORMED_START_PATTERN.finditer(text):
-        name = match.group(1).strip()
-        if name not in all_sections:
-            all_sections[name] = {"start": [], "end": []}
-        all_sections[name]["start"].append((match.start(), match.end()))
-    
-    for match in MALFORMED_END_PATTERN.finditer(text):
-        name = match.group(1).strip()
-        if name not in all_sections:
-            all_sections[name] = {"start": [], "end": []}
-        all_sections[name]["end"].append((match.start(), match.end()))
-    
-    # Process each section to consolidate duplicates and fix format
     cleaned = text
-    offset = 0  # Track offset as we make replacements
     
-    for section_name in sorted(all_sections.keys()):
-        info = all_sections[section_name]
+    # First: Fix orphaned END markers by prepending their matching START markers
+    # Pattern: Find END SECTION/CHAPTER markers that aren't preceded by a START marker
+    def fix_orphaned_end_marker(match):
+        end_marker = match.group(0)
+        section_name = match.group(1)
+        # Extract what comes before this END marker
+        start_pos = match.start()
+        text_before = cleaned[:start_pos]
         
-        # Handle multiple START markers - keep only the first, normalize format
-        if len(info["start"]) > 1:
-            # Keep the first, remove the rest
-            for start, end in info["start"][1:]:
-                adjusted_start = start - offset
-                adjusted_end = end - offset
-                cleaned = cleaned[:adjusted_start] + cleaned[adjusted_end:]
-                offset += end - start
-                stats["duplicates_removed"] += 1
+        # Check if there's a corresponding START marker before this END
+        # Look for the last section start in the text before
+        start_pattern = f"<!-- SECTION: {re.escape(section_name)} -->"
+        if start_pattern not in text_before:
+            # This is an orphaned END marker - need to prepend a START
+            stats["orphaned_markers_fixed"] += 1
+            return f"<!-- SECTION: {section_name} -->\n{end_marker}"
+        return end_marker
+    
+    # Find all END markers and check if they're orphaned
+    orphaned_pattern = r"<!--\s*END\s+(?:SECTION|CHAPTER):\s*([^\n]+?)\s*-->"
+    
+    # We need to process this carefully to detect orphaned markers
+    # Simple approach: look for END markers that aren't preceded by START
+    fixed_cleaned = cleaned
+    for match in re.finditer(orphaned_pattern, cleaned, flags=re.IGNORECASE):
+        section_name = match.group(1).strip()
+        start_pos = match.start()
+        text_before = cleaned[:start_pos]
         
-        # Handle multiple END markers - keep only the first, remove the rest
-        if len(info["end"]) > 1:
-            for start, end in info["end"][1:]:
-                adjusted_start = start - offset
-                adjusted_end = end - offset
-                cleaned = cleaned[:adjusted_start] + cleaned[adjusted_end:]
-                offset += end - start
-                stats["duplicates_removed"] += 1
+        # Check if there's a corresponding START marker before this END
+        # Look for either:
+        # - <!-- SECTION: name --> or
+        # - <!-- START SECTION: name --> or
+        # - <!-- CHAPTER: name --> or
+        # - <!-- START CHAPTER: name -->
+        start_markers = [
+            f"<!-- SECTION: {section_name} -->",
+            f"<!-- START SECTION: {section_name} -->",
+            f"<!-- CHAPTER: {section_name} -->",
+            f"<!-- START CHAPTER: {section_name} -->",
+        ]
         
-        # Normalize marker format
-        if info["start"]:
-            old_start = info["start"][0]
-            normalized = f"<!-- SECTION: {section_name} -->"
-            # This is approximate - in practice, better to do a second pass
+        found_start = any(marker in text_before for marker in start_markers)
+        
+        if not found_start:
+            # This is an orphaned END marker - prepend a START
+            end_marker_str = match.group(0)
+            fixed_cleaned = fixed_cleaned.replace(
+                end_marker_str, 
+                f"<!-- SECTION: {section_name} -->\n{end_marker_str}",
+                1  # Only replace the first occurrence
+            )
+            stats["orphaned_markers_fixed"] += 1
+    
+    cleaned = fixed_cleaned
     
     # Second pass: normalize all markers to standard format
     cleaned = re.sub(
-        r"<!--\s*(?:SECTION|START\s+SECTION):\s*([^\n]+?)\s*-->",
+        r"<!--\s*(?:SECTION|START\s+(?:SECTION|CHAPTER)|CHAPTER):\s*([^\n]+?)\s*-->",
         lambda m: f"<!-- SECTION: {m.group(1).strip()} -->",
         cleaned,
         flags=re.IGNORECASE,
@@ -94,7 +109,7 @@ def normalize_section_markers(text: str) -> tuple[str, dict[str, int]]:
     stats["formats_normalized"] += cleaned.count("<!-- SECTION:")
     
     cleaned = re.sub(
-        r"<!--\s*(?:END\s+)?SECTION:\s*([^\n]+?)\s*-->",
+        r"<!--\s*END\s+(?:SECTION|CHAPTER):\s*([^\n]+?)\s*-->",
         lambda m: f"<!-- END SECTION: {m.group(1).strip()} -->",
         cleaned,
         flags=re.IGNORECASE,
