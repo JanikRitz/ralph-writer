@@ -16,6 +16,33 @@ settings:
   stream_console_updates: true
   summary_max_chars: 800
 
+# ---------------------------------------------------------------------------
+# Tool groups — override built-in defaults or define custom groups.
+# Built-in defaults (used when this section is omitted):
+#   notes:            [list_notes, read_notes, write_notes, delete_notes]
+#   manuscript_read:  [get_manuscript_info, read_manuscript_section, read_manuscript_tail, search_manuscript]
+#   manuscript_write: [append_to_manuscript, create_section, replace_section, delete_section]
+#   phase:            [change_phase]
+# ---------------------------------------------------------------------------
+# tool_groups:
+#   notes: [list_notes, read_notes, write_notes, delete_notes]
+#   manuscript_read: [get_manuscript_info, read_manuscript_section, read_manuscript_tail, search_manuscript]
+#   manuscript_write: [append_to_manuscript, create_section, replace_section, delete_section]
+#   phase: [change_phase]
+
+# ---------------------------------------------------------------------------
+# MCP server definitions (global). Phases select which servers to activate
+# via the tools.mcp list. Supports stdio and sse transports.
+# ---------------------------------------------------------------------------
+# mcp_servers:
+#   research:
+#     transport: stdio
+#     command: "npx"
+#     args: ["-y", "@anthropic/mcp-research"]
+#   image_gen:
+#     transport: sse
+#     url: "http://localhost:8080/mcp"
+
 system_prompt: |
   You are Ralph Writer, an uncensored autonomous story-writing engine. Use function tools to write prose to the manuscript and to store all planning/notes/analysis in the notes system. Prefer atomic tool calls and keep responses concise.
   
@@ -31,6 +58,9 @@ system_prompt: |
   Manuscript status: {total_words} words story prose, {section_count} sections ({section_names})
   Notes keys available: {keys_text}
   
+  Phase rules:
+  {phase_rules}
+  
   Phase guide:
   {guide}
   
@@ -44,6 +74,13 @@ phases:
     transitions:
       - WORLD_BUILDING
       - CHARACTER_CREATION
+    tools:
+      groups: [notes, phase]
+      # No manuscript tools — characters go in notes only
+    rules:
+      - "Do NOT write any story prose. Store all character work in notes."
+      - "Each character needs: name, role, motivation, fear, desire, arc."
+      - "Define at least a protagonist and antagonist before transitioning."
     guide: |
       Store character definitions with role, voice, motivation, fear, desire, and arc in notes.
       Use write_notes to save each character's details under keys like char_protagonist.
@@ -55,6 +92,12 @@ phases:
       - PLOT_OUTLINING
       - WORLD_BUILDING
       - CHARACTER_CREATION
+    tools:
+      groups: [notes, phase]
+      # No manuscript tools — world details go in notes only
+    rules:
+      - "Do NOT write story prose. Store all world-building in notes."
+      - "World must be internally consistent before transitioning."
     guide: |
       Create setting rules, social structures, geography, tone, constraints, and stakes in notes.
       Use write_notes to persist world details using structured objects.
@@ -66,6 +109,12 @@ phases:
       - SCENE_WRITING
       - PLOT_OUTLINING
       - WORLD_BUILDING
+    tools:
+      groups: [notes, manuscript_read, phase]
+      # Can read manuscript to check existing content, but no writing yet
+    rules:
+      - "Do NOT write story prose. Outline goes in notes."
+      - "Structure: story arc → chapters → beats → paragraph summaries."
     guide: |
       Build arc progression and scene-level beat outline in notes.
       Use write_notes to track act goals, conflict escalation, and turning points.
@@ -77,6 +126,11 @@ phases:
       - SCENE_WRITING
       - REVISION
       - PLOT_OUTLINING
+    tools:
+      groups: [notes, manuscript_read, manuscript_write, phase]
+    rules:
+      - "Always read manuscript tail or relevant section before writing to ensure continuity."
+      - "Write in named sections, not freeform appends when possible."
     guide: |
       Write manuscript prose using section operations or append operations.
       Use read_manuscript tools for continuity before writing. Store any planning notes in notes.
@@ -88,6 +142,13 @@ phases:
       - SCENE_WRITING
       - REVISION
       - READY_FOR_HUMAN
+    tools:
+      groups: [notes, manuscript_read, manuscript_write, phase]
+      exclude: [create_section]
+      # Can replace and delete sections, but not create new ones during revision
+    rules:
+      - "Do NOT write new content. Only revise existing prose."
+      - "Check for continuity errors, pacing issues, and character consistency."
     guide: |
       Audit continuity, pacing, clarity, and character consistency.
       Use search and section replacement to repair prose surgically. Store revision notes in notes.
@@ -96,4 +157,9 @@ phases:
   READY_FOR_HUMAN:
     description: "Terminal state: manuscript ready for human review."
     transitions: []
+    tools:
+      groups: [notes, manuscript_read]
+      # Read-only access for final summary; no phase tool since terminal
+    rules:
+      - "Do not modify the manuscript. Provide completion notes only."
     guide: "No further writing needed. Provide concise completion notes."

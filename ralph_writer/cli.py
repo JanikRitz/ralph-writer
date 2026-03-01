@@ -17,7 +17,9 @@ from ralph_writer.config.models import LoadedPhaseConfig, RuntimeSettings
 from ralph_writer.core import Project
 from ralph_writer.images import extract_image_refs, validate_image_paths
 from ralph_writer.manuscript import get_manuscript_info_data
+from ralph_writer.mcp_client import MCPServerConfig, MCPToolRegistry, parse_mcp_configs
 from ralph_writer.orchestrator import SessionOrchestrator, show_stats_table, show_status
+from ralph_writer.tools import DEFAULT_TOOL_GROUPS
 
 
 PROJECTS_DIR = Path("projects")
@@ -37,19 +39,47 @@ def load_phase_config(config_path: Path) -> LoadedPhaseConfig:
 	phases_data = config.get("phases", {})
 	settings = config.get("settings", {})
 
+	# Tool groups: merge user overrides on top of defaults
+	user_tool_groups = config.get("tool_groups", {})
+	tool_groups = {**DEFAULT_TOOL_GROUPS, **user_tool_groups}
+
+	# MCP server definitions (global)
+	mcp_servers: dict[str, dict[str, Any]] = config.get("mcp_servers", {})
+
 	state_machine: dict[str, dict[str, Any]] = {}
 	phase_guide: dict[str, str] = {}
+	phase_rules: dict[str, list[str]] = {}
 
 	for phase_name, phase_config in phases_data.items():
-		state_machine[phase_name] = {
+		phase_entry: dict[str, Any] = {
 			"description": phase_config.get("description", ""),
 			"transitions": phase_config.get("transitions", []),
 		}
+
+		# Parse per-phase tools config (groups / include / exclude / mcp)
+		tools_block = phase_config.get("tools")
+		if tools_block is not None:
+			phase_entry["tools"] = {
+				"groups": tools_block.get("groups", []),
+				"include": tools_block.get("include", []),
+				"exclude": tools_block.get("exclude", []),
+				"mcp": tools_block.get("mcp", []),
+			}
+
+		state_machine[phase_name] = phase_entry
 		phase_guide[phase_name] = phase_config.get("guide", "")
+
+		# Parse per-phase rules
+		rules = phase_config.get("rules", [])
+		if rules:
+			phase_rules[phase_name] = list(rules)
 
 	return LoadedPhaseConfig(
 		state_machine=state_machine,
 		phase_guide=phase_guide,
+		phase_rules=phase_rules,
+		tool_groups=tool_groups,
+		mcp_servers=mcp_servers,
 		default_phase=default_phase,
 		system_prompt_template=system_prompt_template,
 		settings=settings,
@@ -486,9 +516,16 @@ def main() -> None:
 	phase_config = load_phase_config(config_path)
 	state_machine = phase_config.state_machine
 	phase_guide = phase_config.phase_guide
+	phase_rules = phase_config.phase_rules
+	tool_groups = phase_config.tool_groups
+	mcp_servers = phase_config.mcp_servers
 	default_phase = phase_config.default_phase
 	system_prompt_template = phase_config.system_prompt_template
 	runtime_config = RuntimeSettings.from_sources(phase_config.settings).to_dict()
+
+	# Initialize MCP registry from config
+	mcp_configs = parse_mcp_configs(mcp_servers) if mcp_servers else {}
+	mcp_registry = MCPToolRegistry(mcp_configs) if mcp_configs else None
 
 	client = OpenAI(base_url=runtime_config["base_url"], api_key=runtime_config["api_key"])
 	project = choose_or_create_project(default_phase)
@@ -499,7 +536,15 @@ def main() -> None:
 		config=runtime_config,
 		state_machine=state_machine,
 		phase_guide=phase_guide,
+		phase_rules=phase_rules,
+		tool_groups=tool_groups,
+		mcp_servers=mcp_servers,
+		mcp_registry=mcp_registry,
 		system_prompt_template=system_prompt_template,
 	)
 
-	orchestrator.run_session()
+	try:
+		orchestrator.run_session()
+	finally:
+		if mcp_registry:
+			mcp_registry.disconnect_all()

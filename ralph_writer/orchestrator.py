@@ -14,7 +14,8 @@ from rich.console import Console
 from ralph_writer.core import IterationResult, Project
 from ralph_writer.images import build_vision_message_blocks
 from ralph_writer.manuscript import get_manuscript_info_data
-from ralph_writer.tools import execute_tool, get_tool_definitions
+from ralph_writer.mcp_client import MCPToolRegistry, is_mcp_tool
+from ralph_writer.tools import execute_tool, get_tool_definitions, resolve_phase_tools
 from ralph_writer.utils import (
 	estimate_tokens_messages,
 	estimate_tokens_text,
@@ -116,6 +117,7 @@ def build_system_prompt(
 	manuscript_info: dict[str, Any],
 	state_machine: dict[str, dict[str, Any]],
 	phase_guide: dict[str, str],
+	phase_rules: dict[str, list[str]],
 	system_prompt_template: str,
 	config: dict[str, Any],
 ) -> str:
@@ -133,6 +135,13 @@ def build_system_prompt(
 	keys_text = ", ".join(ai_state_keys) if ai_state_keys else "none"
 	transitions_text = ", ".join(transitions) if transitions else "none"
 
+	# Format phase rules
+	rules = phase_rules.get(phase, [])
+	if rules:
+		rules_text = "\n".join(f"  {i+1}. {rule}" for i, rule in enumerate(rules))
+	else:
+		rules_text = "  None"
+
 	return system_prompt_template.format(
 		initial_seed=state.get("initial_seed", ""),
 		phase=phase,
@@ -143,6 +152,7 @@ def build_system_prompt(
 		section_names=section_names,
 		keys_text=keys_text,
 		guide=guide,
+		phase_rules=rules_text,
 		previous_summary=previous_summary or "none",
 	)
 
@@ -262,7 +272,11 @@ class SessionOrchestrator:
 		config: dict[str, Any],
 		state_machine: dict[str, dict[str, Any]],
 		phase_guide: dict[str, str],
+		phase_rules: dict[str, list[str]],
+		tool_groups: dict[str, list[str]],
+		mcp_servers: dict[str, dict[str, Any]],
 		system_prompt_template: str,
+		mcp_registry: MCPToolRegistry | None = None,
 	):
 		"""Initialize orchestrator.
 		
@@ -272,14 +286,22 @@ class SessionOrchestrator:
 			config: Runtime configuration dict
 			state_machine: Phase state machine definitions
 			phase_guide: Phase guide strings
+			phase_rules: Phase rules (soft constraints per phase)
+			tool_groups: Tool group name → tool name list mapping
+			mcp_servers: MCP server configurations
 			system_prompt_template: System prompt template string
+			mcp_registry: Optional MCP tool registry
 		"""
 		self.project = project
 		self.client = client
 		self.config = config
 		self.state_machine = state_machine
 		self.phase_guide = phase_guide
+		self.phase_rules = phase_rules
+		self.tool_groups = tool_groups
+		self.mcp_servers = mcp_servers
 		self.system_prompt_template = system_prompt_template
+		self.mcp_registry = mcp_registry
 
 	def should_continue(self, state: dict[str, Any]) -> bool:
 		"""Check if session should continue based on current state."""
@@ -318,11 +340,34 @@ class SessionOrchestrator:
 			manuscript_info,
 			self.state_machine,
 			self.phase_guide,
+			self.phase_rules,
 			self.system_prompt_template,
 			self.config,
 		)
 		project_dir = self.project.project_dir
 		user_content_blocks = build_user_message(state, project_dir)
+
+		# Resolve which tools are allowed for the current phase
+		allowed_tools = resolve_phase_tools(
+			initial_phase, self.state_machine, self.tool_groups
+		)
+		if allowed_tools is not None:
+			console.print(
+				f"[dim]Phase tools ({len(allowed_tools)}): "
+				f"{', '.join(sorted(allowed_tools))}[/dim]"
+			)
+
+		# Merge MCP tool definitions if an MCP registry is available
+		phase_tools_config = self.state_machine.get(initial_phase, {}).get("tools", {})
+		mcp_server_names: list[str] = phase_tools_config.get("mcp", []) if phase_tools_config else []
+		mcp_tool_defs: list[dict[str, Any]] = []
+		if self.mcp_registry and mcp_server_names:
+			mcp_tool_defs = self.mcp_registry.get_all_definitions(mcp_server_names)
+			if mcp_tool_defs:
+				console.print(
+					f"[dim]MCP tools ({len(mcp_tool_defs)}) from: "
+					f"{', '.join(mcp_server_names)}[/dim]"
+				)
 
 		# Show feedback if images are being provided
 		image_paths = state.get("image_paths", [])
@@ -352,10 +397,12 @@ class SessionOrchestrator:
 			streamed_tool_names_announced: set[int] = set()
 
 			try:
+				# Build tool list: filtered built-in tools + MCP tools
+				combined_tools = get_tool_definitions(allowed_tools) + mcp_tool_defs
 				with self.client.chat.completions.stream(
 					model=self.config["model"],
 					messages=messages,
-					tools=get_tool_definitions(),
+					tools=combined_tools,
 					tool_choice="auto",
 				) as stream:
 					if self.config["stream_console_updates"]:
@@ -408,10 +455,22 @@ class SessionOrchestrator:
 			if self.config["stream_console_updates"]:
 				console.print()
 
+			# Note: streaming responses don't reliably include usage data from the API
+			# Instead, we estimate tokens from the request and response content
 			usage = completion.usage
 			if usage:
 				total_in_tokens += int(usage.prompt_tokens or 0)
 				total_out_tokens += int(usage.completion_tokens or 0)
+			else:
+				# Fallback: estimate tokens when usage data is unavailable (common with streaming)
+				# Estimate input tokens from messages excluding the current response
+				estimated_in = estimate_tokens_messages(self.config["model"], messages)
+				# Estimate output tokens from the assistant's response
+				estimated_out = estimate_tokens_text(self.config["model"], final_text or "(no response)")
+				total_in_tokens += estimated_in
+				total_out_tokens += estimated_out
+				if self.config["stream_console_updates"]:
+					console.print(f"[dim]Token estimates (API usage unavailable): in={estimated_in}, out={estimated_out}[/dim]")
 
 			message = completion.choices[0].message
 			assistant_text = message.content or final_text
@@ -486,7 +545,12 @@ class SessionOrchestrator:
 				phase_before_call = state.get("phase", "CHARACTER_CREATION")
 				if not phase_transitions or phase_transitions[-1] != phase_before_call:
 					phase_transitions.append(phase_before_call)
-				result = execute_tool(fn_name, args, state, self.project.state_path, self.project.manuscript_path, self.state_machine)
+
+				# Route MCP tool calls to the MCP registry
+				if is_mcp_tool(fn_name) and self.mcp_registry:
+					result = self.mcp_registry.route_tool_call(fn_name, args)
+				else:
+					result = execute_tool(fn_name, args, state, self.project.state_path, self.project.manuscript_path, self.state_machine, allowed_tools)
 				phase_after_call = state.get("phase", "CHARACTER_CREATION")
 
 				# Detect phase change from any tool call in the batch

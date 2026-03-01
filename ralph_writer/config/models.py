@@ -74,6 +74,9 @@ class RuntimeSettings:
 class LoadedPhaseConfig:
     state_machine: dict[str, dict[str, Any]]
     phase_guide: dict[str, str]
+    phase_rules: dict[str, list[str]]
+    tool_groups: dict[str, list[str]]
+    mcp_servers: dict[str, dict[str, Any]]
     default_phase: str
     system_prompt_template: str
     settings: dict[str, Any]

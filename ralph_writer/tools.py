@@ -11,6 +11,28 @@ from ralph_writer.manuscript import get_manuscript_info_data, parse_sections, re
 from ralph_writer.utils import count_words, read_json, write_json
 
 
+# ---------------------------------------------------------------------------
+# Tool groups — canonical mapping of group names to tool names.
+# Users can override these in config.yaml via the top-level `tool_groups:` key.
+# ---------------------------------------------------------------------------
+DEFAULT_TOOL_GROUPS: dict[str, list[str]] = {
+    "notes": ["list_notes", "read_notes", "write_notes", "delete_notes"],
+    "manuscript_read": [
+        "get_manuscript_info",
+        "read_manuscript_section",
+        "read_manuscript_tail",
+        "search_manuscript",
+    ],
+    "manuscript_write": [
+        "append_to_manuscript",
+        "create_section",
+        "replace_section",
+        "delete_section",
+    ],
+    "phase": ["change_phase"],
+}
+
+
 def summarize_keys(ai_state: dict[str, Any]) -> dict[str, str]:
     """Summarize AI state keys with type/size hints."""
     result: dict[str, str] = {}
@@ -32,9 +54,14 @@ def summarize_keys(ai_state: dict[str, Any]) -> dict[str, str]:
     return result
 
 
-def get_tool_definitions() -> list[dict[str, Any]]:
-    """Return OpenAI-compatible tool definitions."""
-    return [
+def get_tool_definitions(allowed_tools: set[str] | None = None) -> list[dict[str, Any]]:
+    """Return OpenAI-compatible tool definitions.
+
+    Args:
+        allowed_tools: If provided, only return definitions for tools in this set.
+                       If None, return all tools (backward-compatible default).
+    """
+    all_defs = [
         {
             "type": "function",
             "function": {
@@ -212,6 +239,52 @@ def get_tool_definitions() -> list[dict[str, Any]]:
         },
     ]
 
+    if allowed_tools is not None:
+        all_defs = [d for d in all_defs if d["function"]["name"] in allowed_tools]
+    return all_defs
+
+
+def resolve_phase_tools(
+    phase: str,
+    state_machine: dict[str, dict[str, Any]],
+    tool_groups: dict[str, list[str]] | None = None,
+) -> set[str] | None:
+    """Resolve the set of allowed tool names for a given phase.
+
+    Returns None if the phase has no ``tools:`` config block (meaning all
+    tools are allowed — backward-compatible default).
+
+    Resolution order:
+      1. Expand every group listed in ``tools.groups``
+      2. Union with ``tools.include``
+      3. Subtract ``tools.exclude``
+
+    Args:
+        phase: Current phase name.
+        state_machine: The full state machine dict (phases → config).
+        tool_groups: Group-name → tool-name-list mapping.
+                     Falls back to ``DEFAULT_TOOL_GROUPS`` when *None*.
+    """
+    groups = tool_groups or DEFAULT_TOOL_GROUPS
+    phase_def = state_machine.get(phase, {})
+    tools_config = phase_def.get("tools")
+
+    if tools_config is None:
+        return None  # no restriction configured
+
+    allowed: set[str] = set()
+
+    for group_name in tools_config.get("groups", []):
+        allowed.update(groups.get(group_name, []))
+
+    for tool_name in tools_config.get("include", []):
+        allowed.add(tool_name)
+
+    for tool_name in tools_config.get("exclude", []):
+        allowed.discard(tool_name)
+
+    return allowed
+
 
 def execute_tool(
     name: str,
@@ -220,8 +293,20 @@ def execute_tool(
     state_path: Path,
     manuscript_path: Path,
     state_machine: dict[str, dict[str, Any]],
+    allowed_tools: set[str] | None = None,
 ) -> Any:
-    """Execute a named tool with given arguments."""
+    """Execute a named tool with given arguments.
+
+    Args:
+        allowed_tools: If provided, reject tools not in this set.
+    """
+    # Hard enforcement: reject tools not allowed in current phase
+    if allowed_tools is not None and name not in allowed_tools:
+        return {
+            "error": f"tool '{name}' is not available in the current phase",
+            "available_tools": sorted(allowed_tools),
+        }
+
     ai_state = state.setdefault("ai_state", {})
 
     def available_sections() -> list[str]:
