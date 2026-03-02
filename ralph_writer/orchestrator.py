@@ -522,6 +522,7 @@ class SessionOrchestrator:
 				break
 
 			stop_due_to_tool_limit = False
+			warned_about_tool_limit = False
 			for tool_call in normalized_tool_calls:
 				if self.config["max_tool_calls_per_iteration"] > 0 and total_tool_calls >= self.config["max_tool_calls_per_iteration"]:
 					status = (
@@ -533,6 +534,28 @@ class SessionOrchestrator:
 					break
 
 				total_tool_calls += 1
+				
+				# Warn LLM when approaching tool call limit (80% threshold)
+				if (
+					self.config["max_tool_calls_per_iteration"] > 0
+					and not warned_about_tool_limit
+					and total_tool_calls >= self.config["max_tool_calls_per_iteration"] * 0.8
+					and total_tool_calls < self.config["max_tool_calls_per_iteration"]
+				):
+					warned_about_tool_limit = True
+					warning_msg = (
+						f"⚠️ TOOL CALL LIMIT WARNING: You have used {total_tool_calls} out of "
+						f"{self.config['max_tool_calls_per_iteration']} tool calls (80% capacity). "
+						f"Plan your remaining actions carefully to avoid hitting the hard limit."
+					)
+					console.print(f"[yellow]{warning_msg}[/yellow]")
+					messages.append(
+						{
+							"role": "user",
+							"content": warning_msg,
+						}
+					)
+				
 				fn_name = tool_call["name"]
 				raw_args = tool_call["arguments"] or "{}"
 				try:
