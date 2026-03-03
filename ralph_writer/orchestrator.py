@@ -620,7 +620,7 @@ class SessionOrchestrator:
 		if not phase_history:
 			# Initialize with current phase if empty
 			phase_history = [{
-				"phase": final_phase,
+				"phase": initial_phase,
 				"entered_at": now_iso(),
 				"exited_at": None,
 				"exit_reason": None,

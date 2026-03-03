@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from ralph_writer.manuscript import get_manuscript_info_data, parse_sections, read_manuscript, write_manuscript, heal_manuscript
+from ralph_writer.manuscript import get_manuscript_info_data, parse_sections, read_manuscript, write_manuscript, heal_manuscript, add_beat_to_manuscript, update_beat_content, append_to_beat
 from ralph_writer.utils import count_words, read_json, write_json
 
 
@@ -21,13 +21,13 @@ DEFAULT_TOOL_GROUPS: dict[str, list[str]] = {
         "get_manuscript_info",
         "read_manuscript_section",
         "read_manuscript_tail",
+        "read_beat",
         "search_manuscript",
     ],
     "manuscript_write": [
-        "append_to_manuscript",
-        "create_section",
-        "replace_section",
-        "delete_section",
+        "add_beat",
+        "update_beat",
+        "append_to_beat",
     ],
     "phase": ["change_phase"],
 }
@@ -219,6 +219,73 @@ def get_tool_definitions(allowed_tools: set[str] | None = None) -> list[dict[str
                     "type": "object",
                     "properties": {"name": {"type": "string", "description": "Section name"}},
                     "required": ["name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_beat",
+                "description": "Add a beat to a chapter in a storyline. Auto-creates parent hierarchy if needed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "storyline": {"type": "string", "description": "Storyline name"},
+                        "chapter": {"type": "string", "description": "Chapter name"},
+                        "beat": {"type": "string", "description": "Beat name"},
+                        "content": {"type": "string", "description": "Beat content (prose)"},
+                    },
+                    "required": ["storyline", "chapter", "beat", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "update_beat",
+                "description": "Replace the content of an existing beat.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "storyline": {"type": "string", "description": "Storyline name"},
+                        "chapter": {"type": "string", "description": "Chapter name"},
+                        "beat": {"type": "string", "description": "Beat name"},
+                        "content": {"type": "string", "description": "New beat content"},
+                    },
+                    "required": ["storyline", "chapter", "beat", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "append_to_beat",
+                "description": "Append content to the end of an existing beat.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "storyline": {"type": "string", "description": "Storyline name"},
+                        "chapter": {"type": "string", "description": "Chapter name"},
+                        "beat": {"type": "string", "description": "Beat name"},
+                        "content": {"type": "string", "description": "Content to append"},
+                    },
+                    "required": ["storyline", "chapter", "beat", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_beat",
+                "description": "Read the content of a specific beat in the hierarchy.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "storyline": {"type": "string", "description": "Storyline name"},
+                        "chapter": {"type": "string", "description": "Chapter name"},
+                        "beat": {"type": "string", "description": "Beat name"},
+                    },
+                    "required": ["storyline", "chapter", "beat"],
                 },
             },
         },
@@ -433,6 +500,82 @@ def execute_tool(
             updated = (text[: target["start"]] + text[target["end"] :]).strip("\n") + "\n"
             write_manuscript(manuscript_path, updated)
             return f"deleted section '{section_name}'"
+
+        if name == "add_beat":
+            storyline = arguments["storyline"].strip()
+            chapter = arguments["chapter"].strip()
+            beat = arguments["beat"].strip()
+            content = arguments["content"].strip()
+            
+            heal_manuscript(manuscript_path)
+            text = read_manuscript(manuscript_path)
+            updated = add_beat_to_manuscript(text, storyline, chapter, beat, content)
+            write_manuscript(manuscript_path, updated)
+            return f"added beat '{beat}' to {storyline}/{chapter} ({count_words(content)} words)"
+
+        if name == "update_beat":
+            storyline = arguments["storyline"].strip()
+            chapter = arguments["chapter"].strip()
+            beat = arguments["beat"].strip()
+            content = arguments["content"].strip()
+            
+            heal_manuscript(manuscript_path)
+            text = read_manuscript(manuscript_path)
+            updated, success = update_beat_content(text, storyline, chapter, beat, content)
+            if not success:
+                hierarchy = parse_story_hierarchy(text)
+                beats_list = []
+                for sl in hierarchy["storylines"]:
+                    for ch in sl["chapters"]:
+                        for bt in ch["beats"]:
+                            beats_list.append(f"{sl['name']}/{ch['name']}/{bt['name']}")
+                return {"error": f"beat not found at {storyline}/{chapter}/{beat}", "available": beats_list}
+            write_manuscript(manuscript_path, updated)
+            return f"updated beat '{beat}' in {storyline}/{chapter} ({count_words(content)} words)"
+
+        if name == "append_to_beat":
+            storyline = arguments["storyline"].strip()
+            chapter = arguments["chapter"].strip()
+            beat = arguments["beat"].strip()
+            content = arguments["content"].strip()
+            
+            heal_manuscript(manuscript_path)
+            text = read_manuscript(manuscript_path)
+            updated, success = append_to_beat(text, storyline, chapter, beat, content)
+            if not success:
+                hierarchy = parse_story_hierarchy(text)
+                beats_list = []
+                for sl in hierarchy["storylines"]:
+                    for ch in sl["chapters"]:
+                        for bt in ch["beats"]:
+                            beats_list.append(f"{sl['name']}/{ch['name']}/{bt['name']}")
+                return {"error": f"beat not found at {storyline}/{chapter}/{beat}", "available": beats_list}
+            write_manuscript(manuscript_path, updated)
+            return f"appended to beat '{beat}' in {storyline}/{chapter} ({count_words(content)} words)"
+
+        if name == "read_beat":
+            storyline = arguments["storyline"].strip()
+            chapter = arguments["chapter"].strip()
+            beat = arguments["beat"].strip()
+            
+            heal_manuscript(manuscript_path)
+            text = read_manuscript(manuscript_path)
+            hierarchy = parse_story_hierarchy(text)
+            
+            for sl in hierarchy["storylines"]:
+                if sl["name"] == storyline:
+                    for ch in sl["chapters"]:
+                        if ch["name"] == chapter:
+                            for bt in ch["beats"]:
+                                if bt["name"] == beat:
+                                    return {"content": "\n\n".join(bt["paragraphs"]), "words": bt["words"]}
+            
+            beats_list = []
+            for sl in hierarchy["storylines"]:
+                for ch in sl["chapters"]:
+                    for bt in ch["beats"]:
+                        beats_list.append(f"{sl['name']}/{ch['name']}/{bt['name']}")
+            return {"error": f"beat not found at {storyline}/{chapter}/{beat}", "available": beats_list}
 
         if name == "change_phase":
             from datetime import datetime
