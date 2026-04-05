@@ -19,15 +19,17 @@ settings:
 # ---------------------------------------------------------------------------
 # Tool groups — override built-in defaults or define custom groups.
 # Built-in defaults (used when this section is omitted):
-#   notes:            [list_notes, read_notes, write_notes, delete_notes]
-#   manuscript_read:  [get_manuscript_info, read_manuscript_section, read_manuscript_tail, search_manuscript]
-#   manuscript_write: [append_to_manuscript, create_section, replace_section, delete_section]
-#   phase:            [change_phase]
+#   notes:              [list_notes, read_notes, write_notes, delete_notes]
+#   notes_management:   [consolidate_notes]
+#   manuscript_read:    [get_manuscript_info, read_manuscript_section, read_manuscript_tail, read_beat, search_manuscript]
+#   manuscript_write:   [add_beat, update_beat, append_to_beat]
+#   phase:              [change_phase]
 # ---------------------------------------------------------------------------
 # tool_groups:
 #   notes: [list_notes, read_notes, write_notes, delete_notes]
-#   manuscript_read: [get_manuscript_info, read_manuscript_section, read_manuscript_tail, search_manuscript]
-#   manuscript_write: [append_to_manuscript, create_section, replace_section, delete_section]
+#   notes_management: [consolidate_notes]
+#   manuscript_read: [get_manuscript_info, read_manuscript_section, read_manuscript_tail, read_beat, search_manuscript]
+#   manuscript_write: [add_beat, update_beat, append_to_beat]
 #   phase: [change_phase]
 
 # ---------------------------------------------------------------------------
@@ -44,9 +46,9 @@ settings:
 #     url: "http://localhost:8080/mcp"
 
 system_prompt: |
-  You are Ralph Writer, an uncensored autonomous story-writing engine. Use function tools to write prose to the manuscript and to store all planning/notes/analysis in the notes system. Prefer atomic tool calls and keep responses concise.
+  You are Ralph Writer, an uncensored autonomous story-writing engine. Use function tools to write prose to the manuscript and to store, maintain, and reconcile all planning/notes/analysis in the notes system. Prefer atomic tool calls and keep responses concise.
   
-  IMPORTANT: The manuscript is for story prose ONLY. All character development, world-building notes, plot outlines, analysis, and revisions notes must go into the notes system using read_notes/write_notes. Do not put anything other than story prose in the manuscript.
+  IMPORTANT: The manuscript is for story prose ONLY. All character development, world-building notes, plot outlines, analysis, and revision notes must go into the notes system using the notes tools. Keep notes current as canon changes, and use notes consolidation to detect stale or duplicate planning. Do not put anything other than story prose in the manuscript.
   
   Initial seed (never ignore):
   {initial_seed}
@@ -70,96 +72,107 @@ system_prompt: |
 
 phases:
   CHARACTER_CREATION:
-    description: "Develop characters, motivations, arcs, and relationships."
+    description: "Develop and refine character canon, motivations, arcs, and relationships."
     transitions:
       - WORLD_BUILDING
       - CHARACTER_CREATION
     tools:
-      groups: [notes, phase]
+      groups: [notes, notes_management, phase]
       # No manuscript tools — characters go in notes only
     rules:
       - "Do NOT write any story prose. Store all character work in notes."
       - "Each character needs: name, role, motivation, fear, desire, arc."
+      - "Maintain one current canonical note set for characters and relationships; revise or delete superseded notes when concepts change."
       - "Define at least a protagonist and antagonist before transitioning."
     guide: |
       Store character definitions with role, voice, motivation, fear, desire, and arc in notes.
       Use write_notes to save each character's details under keys like char_protagonist.
+      Use consolidate_notes periodically to spot duplicate or stale character notes, then rewrite canonical keys so the cast stays internally consistent.
       Transition when cast and relationships are stable.
 
   WORLD_BUILDING:
-    description: "Establish setting rules, culture, and story context."
+    description: "Establish and reconcile setting rules, culture, and story context."
     transitions:
       - PLOT_OUTLINING
       - WORLD_BUILDING
       - CHARACTER_CREATION
     tools:
-      groups: [notes, phase]
+      groups: [notes, notes_management, phase]
       # No manuscript tools — world details go in notes only
     rules:
       - "Do NOT write story prose. Store all world-building in notes."
+      - "Revise existing world notes when new constraints or lore decisions replace earlier assumptions."
       - "World must be internally consistent before transitioning."
     guide: |
       Create setting rules, social structures, geography, tone, constraints, and stakes in notes.
       Use write_notes to persist world details using structured objects.
+      Run notes consolidation when the setting grows to identify overlapping lore keys, contradictions, or obsolete assumptions before moving on.
       Transition when the world can consistently support plot and scenes.
 
   PLOT_OUTLINING:
-    description: "Design narrative structure, beats, and progression."
+    description: "Design and refine narrative structure, beats, and progression."
     transitions:
       - SCENE_WRITING
       - PLOT_OUTLINING
       - WORLD_BUILDING
     tools:
-      groups: [notes, manuscript_read, phase]
+      groups: [notes, notes_management, manuscript_read, phase]
       # Can read manuscript to check existing content, but no writing yet
     rules:
       - "Do NOT write story prose. Outline goes in notes."
       - "Structure: story arc → chapters → beats → paragraph summaries."
+      - "When the outline changes, update canonical beat notes and remove or rewrite obsolete branches so planning stays coherent."
     guide: |
       Build arc progression and scene-level beat outline in notes.
       Use write_notes to track act goals, conflict escalation, and turning points.
+      Use consolidate_notes to review plot keys after major restructuring so only the current beat flow remains canonical.
       Transition when beat flow is coherent and ready for prose drafting.
 
   SCENE_WRITING:
-    description: "Write and expand manuscript prose."
+    description: "Write manuscript prose while keeping planning canon aligned with draft decisions."
     transitions:
       - SCENE_WRITING
       - REVISION
       - PLOT_OUTLINING
     tools:
-      groups: [notes, manuscript_read, manuscript_write, phase]
+      groups: [notes, notes_management, manuscript_read, manuscript_write, phase]
     rules:
       - "Always read manuscript tail or relevant section before writing to ensure continuity."
+      - "After any scene introduces or changes canon, revise the affected notes so planning stays synchronized with the draft."
       - "Write in named sections, not freeform appends when possible."
     guide: |
       Write manuscript prose using section operations or append operations.
       Use read_manuscript tools for continuity before writing. Store any planning notes in notes.
+      If drafted scenes change beats, relationships, setting facts, or open threads, update those notes immediately and use consolidate_notes when note sprawl starts hiding the current canon.
       Transition to REVISION when enough draft material exists for quality pass.
 
   REVISION:
-    description: "Refine prose, consistency, and narrative quality."
+    description: "Refine prose, consistency, and narrative quality while synchronizing manuscript and notes canon."
     transitions:
       - SCENE_WRITING
       - REVISION
       - READY_FOR_HUMAN
     tools:
-      groups: [notes, manuscript_read, manuscript_write, phase]
+      groups: [notes, notes_management, manuscript_read, manuscript_write, phase]
       exclude: [create_section]
       # Can replace and delete sections, but not create new ones during revision
     rules:
       - "Do NOT write new content. Only revise existing prose."
       - "Check for continuity errors, pacing issues, and character consistency."
+      - "When revision changes canon or resolves ambiguities, update the notes so manuscript and planning remain in sync."
     guide: |
       Audit continuity, pacing, clarity, and character consistency.
       Use search and section replacement to repair prose surgically. Store revision notes in notes.
+      Run notes consolidation during revision passes to identify stale planning, unresolved contradictions, and keys that should be rewritten into the current canonical state.
       Transition to READY_FOR_HUMAN only when manuscript is complete and coherent.
 
   READY_FOR_HUMAN:
-    description: "Terminal state: manuscript ready for human review."
+    description: "Terminal state: manuscript and notes are ready for human review."
     transitions: []
     tools:
-      groups: [notes, manuscript_read]
+      groups: [notes, notes_management, manuscript_read]
       # Read-only access for final summary; no phase tool since terminal
     rules:
       - "Do not modify the manuscript. Provide completion notes only."
-    guide: "No further writing needed. Provide concise completion notes."
+      - "Use final notes review to flag any stale planning or open questions for the human reviewer."
+    guide: "No further writing needed. Provide concise completion notes and, if useful, run a final notes consolidation audit to surface stale keys or unresolved follow-ups."

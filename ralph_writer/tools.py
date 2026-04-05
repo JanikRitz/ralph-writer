@@ -27,6 +27,7 @@ from ralph_writer.utils import count_words, read_json, write_json
 # ---------------------------------------------------------------------------
 DEFAULT_TOOL_GROUPS: dict[str, list[str]] = {
     "notes": ["list_notes", "read_notes", "write_notes", "delete_notes"],
+    "notes_management": ["consolidate_notes"],
     "manuscript_read": [
         "get_manuscript_info",
         "read_manuscript_section",
@@ -62,6 +63,30 @@ def summarize_keys(ai_state: dict[str, Any]) -> dict[str, str]:
         else:
             result[key] = type(value).__name__
     return result
+
+
+def calculate_memory_stats(ai_state: dict[str, Any]) -> dict[str, Any]:
+    """Calculate memory/notes statistics."""
+    total_chars = 0
+    key_sizes: list[tuple[str, int]] = []
+    
+    for key, value in ai_state.items():
+        try:
+            serialized = json.dumps(value, ensure_ascii=False)
+            size = len(serialized)
+            total_chars += size
+            key_sizes.append((key, size))
+        except Exception:
+            pass
+    
+    key_sizes.sort(key=lambda x: x[1], reverse=True)
+    largest_keys = key_sizes[:5]
+    
+    return {
+        "total_keys": len(ai_state),
+        "total_chars": total_chars,
+        "largest_keys": [{'key': k, 'chars': s} for k, s in largest_keys],
+    }
 
 
 def get_tool_definitions(allowed_tools: set[str] | None = None) -> list[dict[str, Any]]:
@@ -119,6 +144,29 @@ def get_tool_definitions(allowed_tools: set[str] | None = None) -> list[dict[str
                     "type": "object",
                     "properties": {"key": {"type": "string", "description": "Notes key"}},
                     "required": ["key"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consolidate_notes",
+                "description": "Analyze memory/notes for consolidation opportunities and get memory statistics. Returns analysis and recommendations without modifying state.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["analyze", "stats"],
+                            "description": "analyze=suggest consolidation opportunities, stats=return memory statistics only",
+                            "default": "analyze",
+                        },
+                        "target_keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional: specific notes keys to analyze. If empty, analyzes all.",
+                        },
+                    },
                 },
             },
         },
@@ -414,6 +462,37 @@ def execute_tool(
             del ai_state[key]
             write_json(state_path, state)
             return f"deleted notes key '{key}' (persisted to file)"
+
+        if name == "consolidate_notes":
+            action = arguments.get("action", "analyze")
+            target_keys = arguments.get("target_keys", [])
+            
+            # Get stats for all keys or just targets
+            if target_keys:
+                target_state = {k: ai_state[k] for k in target_keys if k in ai_state}
+            else:
+                target_state = ai_state
+            
+            stats = calculate_memory_stats(target_state)
+            
+            if action == "stats":
+                return stats
+            
+            # Action: analyze - suggest consolidation opportunities
+            recommendations = []
+            if stats["total_keys"] > 15:
+                recommendations.append(f"Many keys ({stats['total_keys']}): consider merging related entries")
+            if stats["total_chars"] > 50000:
+                recommendations.append(f"Large memory ({stats['total_chars']} chars): archive or compress old notes")
+            if stats["largest_keys"]:
+                largest = stats["largest_keys"][0]
+                recommendations.append(f"Largest key '{largest['key']}' is {largest['chars']} chars")
+            
+            return {
+                "stats": stats,
+                "recommendations": recommendations if recommendations else ["Memory is well-organized."],
+                "hint": "Use write_notes to consolidate keys, or delete_notes to remove obsolete entries.",
+            }
 
         if name == "get_manuscript_info":
             return get_manuscript_info_data(manuscript_path)

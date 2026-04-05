@@ -15,7 +15,7 @@ from ralph_writer.core import IterationResult, Project
 from ralph_writer.images import build_vision_message_blocks
 from ralph_writer.manuscript import get_manuscript_info_data
 from ralph_writer.mcp_client import MCPToolRegistry, is_mcp_tool
-from ralph_writer.tools import execute_tool, get_tool_definitions, resolve_phase_tools
+from ralph_writer.tools import execute_tool, get_tool_definitions, resolve_phase_tools, calculate_memory_stats
 from ralph_writer.utils import (
 	estimate_tokens_messages,
 	estimate_tokens_text,
@@ -170,13 +170,18 @@ def show_status(
 	phase_def = state_machine.get(phase, {"description": "Unknown", "transitions": []})
 	transitions = phase_def.get("transitions", [])
 	transitions_text = ", ".join(transitions) if transitions else "none"
+	
+	# Get memory stats
+	ai_state = state.get("ai_state", {})
+	mem_stats = calculate_memory_stats(ai_state)
 
 	status_text = (
 		f"Project: [bold]{project_name}[/bold]\n"
 		f"Phase: [yellow]{phase}[/yellow]\n"
 		f"Description: {phase_def.get('description', '')}\n"
 		f"Allowed transitions: {transitions_text}\n"
-		f"Manuscript words: {manuscript_info.get('total_words', 0)}"
+		f"Manuscript words: {manuscript_info.get('total_words', 0)}\n"
+		f"Memory notes: [cyan]{mem_stats['total_keys']} keys[/cyan] • [cyan]{mem_stats['total_chars']:,} chars[/cyan]"
 	)
 	console.print(Panel(status_text, title="Ralph Writer Status", border_style="blue"))
 
